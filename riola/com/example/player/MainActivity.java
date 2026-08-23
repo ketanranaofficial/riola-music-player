@@ -1,16 +1,17 @@
 package com.example.player;
 
 import android.app.Activity;
+import android.content.BroadcastReceiver;
 import android.content.ClipData;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
-import android.media.AudioAttributes;
 import android.media.AudioManager;
-import android.media.MediaPlayer;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.SystemClock;
 import android.provider.OpenableColumns;
 import android.text.InputType;
 import android.view.Gravity;
@@ -21,6 +22,7 @@ import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Spinner;
@@ -35,16 +37,24 @@ import java.util.Locale;
 public class MainActivity extends Activity {
 
     private static final int REQ_PICK_TRACKS = 41;
+    private static final int REQ_EXPORT = 42;
+    private static final int REQ_IMPORT = 43;
+    private static final int REQ_POST_NOTIFICATIONS = 44;
 
     private final List<Uri> tracks = new ArrayList<Uri>();
     private final List<String> trackNames = new ArrayList<String>();
-    private final List<Cmd> program = new ArrayList<Cmd>();
+    private List<Program> programs = new ArrayList<Program>();
+    private int currentProgramIndex = 0;
+
+    private boolean ignoreSpinnerEvents = false;
+    private boolean running = false;
 
     private TextView trackListView;
     private TextView programListView;
     private TextView statusView;
     private TextView positionView;
 
+    private Spinner programSpinner;
     private Spinner cmdSpinner;
     private Spinner trackSpinner;
     private Spinner sectionModeSpinner;
@@ -59,38 +69,29 @@ public class MainActivity extends Activity {
     private Button stopButton;
     private Button addButton;
     private Button clearButton;
+    private Button newButton;
+    private Button deleteButton;
+    private Button exportButton;
+    private Button importButton;
+    private Button settingsButton;
 
-    private volatile boolean running = false;
-    private Thread worker = null;
-    private MediaPlayer player = null;
-    private final Object playerLock = new Object();
-
-    private volatile boolean playComplete = false;
-    private volatile boolean playError = false;
-    private volatile boolean seekDone = true;
-
-    private Handler uiHandler;
-    private final Runnable positionTicker = new Runnable() {
+    private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
         @Override
-        public void run() {
-            if (running) {
-                int pos = 0;
-                int dur = 0;
-                boolean playing = false;
-                synchronized (playerLock) {
-                    if (player != null) {
-                        try {
-                            playing = player.isPlaying();
-                            pos = player.getCurrentPosition();
-                            dur = player.getDuration();
-                        } catch (Exception ignored) {
-                        }
-                    }
-                }
-                positionView.setText(playing ? (fmtTime(pos) + " / " + fmtTime(dur)) : "paused");
-                uiHandler.postDelayed(this, 500);
-            } else {
+        public void onReceive(Context ctx, Intent i) {
+            String a = i.getAction();
+            if (PlayerService.BROADCAST_STATUS.equals(a)) {
+                statusView.setText(i.getStringExtra("status"));
+                int pos = i.getIntExtra("pos", 0);
+                int dur = i.getIntExtra("dur", 0);
+                boolean playing = i.getBooleanExtra("playing", false);
+                positionView.setText(playing ? (fmtTime(pos) + " / " + fmtTime(dur)) : "");
+            } else if (PlayerService.BROADCAST_FINISHED.equals(a)) {
+                running = false;
+                runButton.setEnabled(true);
+                stopButton.setEnabled(false);
+                setBuilderEnabled(true);
                 positionView.setText("");
+                statusView.setText("Idle.");
             }
         }
     };
@@ -98,10 +99,12 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        if (SettingsActivity.keepScreenOn(this)) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        } else {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
         setVolumeControlStream(AudioManager.STREAM_MUSIC);
-
-        uiHandler = new Handler();
 
         float density = getResources().getDisplayMetrics().density;
         int pad = Math.round(16f * density);
@@ -109,7 +112,27 @@ public class MainActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(pad, pad, pad, pad);
+        ScrollView scroller = new ScrollView(this);
+        scroller.addView(root);
+        setContentView(scroller);
 
+        // Header with logo + title
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        ImageView logo = new ImageView(this);
+        logo.setImageDrawable(getDrawable(R.drawable.ic_launcher));
+        int logoW = Math.round(40f * density);
+        logo.setLayoutParams(new LinearLayout.LayoutParams(logoW, logoW));
+        TextView title = new TextView(this);
+        title.setText("Programmable Player");
+        title.setTextSize(19f);
+        title.setPadding(Math.round(10f * density), 0, 0, 0);
+        header.addView(logo);
+        header.addView(title);
+        root.addView(header);
+
+        // Tracks
         Button pickButton = new Button(this);
         pickButton.setText("Select Tracks");
         pickButton.setOnClickListener(new View.OnClickListener() {
@@ -125,19 +148,88 @@ public class MainActivity extends Activity {
         ScrollView trackScroller = new ScrollView(this);
         trackScroller.addView(trackListView);
         root.addView(trackScroller, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, Math.round(130f * density)));
+                ViewGroup.LayoutParams.MATCH_PARENT, Math.round(120f * density)));
+
+        // Programs bar
+        LinearLayout progBar = new LinearLayout(this);
+        progBar.setOrientation(LinearLayout.HORIZONTAL);
+        programSpinner = new Spinner(this);
+        programSpinner.setPrompt("Programs");
+        programSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
+                if (!ignoreSpinnerEvents) {
+                    switchProgram(pos);
+                }
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
+        LinearLayout.LayoutParams half = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        progBar.addView(programSpinner, half);
+        newButton = new Button(this);
+        newButton.setText("New");
+        newButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                newProgram();
+            }
+        });
+        progBar.addView(newButton, half);
+        deleteButton = new Button(this);
+        deleteButton.setText("Delete");
+        deleteButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                deleteProgram();
+            }
+        });
+        progBar.addView(deleteButton, half);
+        root.addView(progBar);
+
+        LinearLayout progActionRow = new LinearLayout(this);
+        progActionRow.setOrientation(LinearLayout.HORIZONTAL);
+        exportButton = new Button(this);
+        exportButton.setText("Export");
+        exportButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                exportProgram();
+            }
+        });
+        importButton = new Button(this);
+        importButton.setText("Import");
+        importButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                importProgram();
+            }
+        });
+        settingsButton = new Button(this);
+        settingsButton.setText("Settings");
+        settingsButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startActivity(new Intent(MainActivity.this, SettingsActivity.class));
+            }
+        });
+        progActionRow.addView(exportButton, half);
+        progActionRow.addView(importButton, half);
+        progActionRow.addView(settingsButton, half);
+        root.addView(progActionRow);
 
         TextView builderTitle = new TextView(this);
-        builderTitle.setText("Build program (visual, no plain-text scripting):");
-        builderTitle.setTextSize(14f);
+        builderTitle.setText("Build program (visual):");
+        builderTitle.setTextSize(15f);
         root.addView(builderTitle);
 
         LinearLayout cmdRow = new LinearLayout(this);
         cmdRow.setOrientation(LinearLayout.HORIZONTAL);
         TextView cmdLabel = new TextView(this);
         cmdLabel.setText("Command");
-        LinearLayout.LayoutParams half = new LinearLayout.LayoutParams(0,
-                ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         cmdSpinner = new Spinner(this);
         ArrayAdapter<String> cmdAdapter = new ArrayAdapter<String>(this,
                 android.R.layout.simple_spinner_item,
@@ -156,7 +248,6 @@ public class MainActivity extends Activity {
         });
         cmdRow.addView(cmdLabel, half);
         cmdRow.addView(cmdSpinner, half);
-
         trackSpinner = new Spinner(this);
         refreshTrackSpinner();
         cmdRow.addView(trackSpinner, half);
@@ -213,9 +304,12 @@ public class MainActivity extends Activity {
         clearButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                program.clear();
+                currentProgram().cmds.clear();
                 refreshProgramList();
                 setStatus("Program cleared.");
+                if (SettingsActivity.autoSave(MainActivity.this)) {
+                    Storage.savePrograms(MainActivity.this, programs);
+                }
             }
         });
         actionRow.addView(addButton, half);
@@ -227,7 +321,7 @@ public class MainActivity extends Activity {
         ScrollView programScroller = new ScrollView(this);
         programScroller.addView(programListView);
         root.addView(programScroller, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, Math.round(170f * density)));
+                ViewGroup.LayoutParams.MATCH_PARENT, Math.round(180f * density)));
 
         positionView = new TextView(this);
         positionView.setText("");
@@ -251,8 +345,7 @@ public class MainActivity extends Activity {
         stopButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                haltWorker();
-                setStatus("Stopped.");
+                stopProgram();
             }
         });
         runRow.addView(runButton, half);
@@ -264,8 +357,45 @@ public class MainActivity extends Activity {
         statusView.setTextSize(13f);
         root.addView(statusView);
 
-        setContentView(root);
+        // Load / initialize programs
+        programs = Storage.loadPrograms(this);
+        if (programs.isEmpty()) {
+            programs.add(new Program("Program 1"));
+        }
+        currentProgramIndex = 0;
+        refreshProgramSpinner();
         applyFieldVisibility(cmdSpinner.getSelectedItemPosition());
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (SettingsActivity.keepScreenOn(this)) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        } else {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
+        registerReceiver(statusReceiver, new IntentFilter(PlayerService.BROADCAST_STATUS));
+        registerReceiver(statusReceiver, new IntentFilter(PlayerService.BROADCAST_FINISHED));
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        try {
+            unregisterReceiver(statusReceiver);
+        } catch (Exception ignored) {
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (running) {
+            Intent si = new Intent(this, PlayerService.class);
+            si.setAction(PlayerService.ACTION_STOP);
+            startService(si);
+        }
+        super.onDestroy();
     }
 
     private EditText newNumberEdit(String value) {
@@ -301,6 +431,86 @@ public class MainActivity extends Activity {
         sectionModeRow.setVisibility(section ? View.VISIBLE : View.GONE);
     }
 
+    private Program currentProgram() {
+        return programs.get(currentProgramIndex);
+    }
+
+    private void refreshProgramSpinner() {
+        List<String> names = new ArrayList<String>();
+        for (Program p : programs) {
+            names.add(p.name);
+        }
+        ArrayAdapter<String> a = new ArrayAdapter<String>(this,
+                android.R.layout.simple_spinner_item, names);
+        a.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        programSpinner.setAdapter(a);
+        ignoreSpinnerEvents = true;
+        programSpinner.setSelection(Math.min(currentProgramIndex, programs.size() - 1));
+        ignoreSpinnerEvents = false;
+        refreshProgramList();
+    }
+
+    private void switchProgram(int pos) {
+        if (pos < 0 || pos >= programs.size()) return;
+        currentProgramIndex = pos;
+        refreshProgramList();
+        setStatus("Switched to '" + programs.get(pos).name + "'.");
+    }
+
+    private void newProgram() {
+        String base = "Program";
+        String name = base + " " + (programs.size() + 1);
+        int n = programs.size() + 1;
+        while (programNameExists(name)) {
+            n++;
+            name = base + " " + n;
+        }
+        Program p = new Program(name);
+        programs.add(p);
+        currentProgramIndex = programs.size() - 1;
+        if (SettingsActivity.autoSave(this)) {
+            Storage.savePrograms(this, programs);
+        }
+        refreshProgramSpinner();
+        applyFieldVisibility(cmdSpinner.getSelectedItemPosition());
+        setStatus("Created new program.");
+    }
+
+    private boolean programNameExists(String name) {
+        for (Program p : programs) {
+            if (p.name != null && p.name.equals(name)) return true;
+        }
+        return false;
+    }
+
+    private void deleteProgram() {
+        if (programs.size() <= 1) {
+            toastShort("Keep at least one program.");
+            return;
+        }
+        String removed = currentProgram().name;
+        programs.remove(currentProgramIndex);
+        if (currentProgramIndex >= programs.size()) currentProgramIndex = programs.size() - 1;
+        if (SettingsActivity.autoSave(this)) {
+            Storage.savePrograms(this, programs);
+        }
+        refreshProgramSpinner();
+        setStatus("Deleted '" + removed + "'.");
+    }
+
+    private void refreshProgramList() {
+        StringBuilder sb = new StringBuilder();
+        List<Cmd> cmds = currentProgram().cmds;
+        if (cmds.isEmpty()) {
+            sb.append("(no steps yet)\n");
+        } else {
+            for (int i = 0; i < cmds.size(); i++) {
+                sb.append(i + 1).append(". ").append(cmds.get(i).text).append('\n');
+            }
+        }
+        programListView.setText(sb.toString());
+    }
+
     private void launchPicker() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
@@ -313,29 +523,69 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != REQ_PICK_TRACKS || resultCode != RESULT_OK || data == null) {
+        if (resultCode != RESULT_OK || data == null) {
             return;
         }
-        int before = tracks.size();
-        if (data.getData() != null) {
-            addTrack(data.getData());
-        }
-        ClipData clip = data.getClipData();
-        if (clip != null) {
-            for (int i = 0; i < clip.getItemCount(); i++) {
-                Uri uri = clip.getItemAt(i).getUri();
-                if (uri != null) {
-                    addTrack(uri);
+        if (requestCode == REQ_PICK_TRACKS) {
+            int before = tracks.size();
+            if (data.getData() != null) {
+                addTrack(data.getData());
+            }
+            ClipData clip = data.getClipData();
+            if (clip != null) {
+                for (int i = 0; i < clip.getItemCount(); i++) {
+                    Uri uri = clip.getItemAt(i).getUri();
+                    if (uri != null) {
+                        addTrack(uri);
+                    }
                 }
             }
-        }
-        if (tracks.size() != before) {
-            refreshTrackList();
-            refreshTrackSpinner();
-            Toast.makeText(this, "Loaded " + (tracks.size() - before) + " track(s).",
-                    Toast.LENGTH_SHORT).show();
-        } else {
-            Toast.makeText(this, "No new tracks selected.", Toast.LENGTH_SHORT).show();
+            if (tracks.size() != before) {
+                refreshTrackList();
+                refreshTrackSpinner();
+                Toast.makeText(this, "Loaded " + (tracks.size() - before) + " track(s).",
+                        Toast.LENGTH_SHORT).show();
+            } else {
+                Toast.makeText(this, "No new tracks selected.", Toast.LENGTH_SHORT).show();
+            }
+        } else if (requestCode == REQ_EXPORT) {
+            Uri doc = data.getData();
+            if (doc == null) return;
+            try {
+                String enc = CmdCodec.encodeProgram(currentProgram().cmds);
+                Storage.writeUri(this, doc, enc);
+                toastShort("Exported " + currentProgram().name + ".");
+            } catch (Exception e) {
+                toastLong("Export failed: " + e.getMessage());
+            }
+        } else if (requestCode == REQ_IMPORT) {
+            Uri doc = data.getData();
+            if (doc == null) return;
+            try {
+                String text = Storage.readUri(this, doc);
+                List<Cmd> cmds = CmdCodec.decodeProgram(text);
+                if (cmds.isEmpty()) {
+                    toastShort("No commands found in file.");
+                    return;
+                }
+                StringBuilder sb = new StringBuilder();
+                for (Cmd c : cmds) sb.append(c.text).append('\n');
+                String name = "Imported";
+                int n = 1;
+                while (programNameExists(name + " " + n)) n++;
+                name = name + " " + n;
+                Program p = new Program(name);
+                p.cmds = cmds;
+                programs.add(p);
+                currentProgramIndex = programs.size() - 1;
+                if (SettingsActivity.autoSave(this)) {
+                    Storage.savePrograms(this, programs);
+                }
+                refreshProgramSpinner();
+                toastShort("Imported " + cmds.size() + " commands as '" + name + "'.");
+            } catch (Exception e) {
+                toastLong("Import failed: " + e.getMessage());
+            }
         }
     }
 
@@ -426,13 +676,11 @@ public class MainActivity extends Activity {
             p.keyword = "PLAY";
             p.track = trackIdx;
             p.times = n;
-            p.text = "PLAY  trk" + trackIdx + "  " + n + " TIMES";
             c = p;
         } else if (cmdIdx == 1) {
             PauseCmd p = new PauseCmd();
             p.keyword = "PAUSE";
             p.minutes = n;
-            p.text = "PAUSE  " + n + " MIN";
             c = p;
         } else if (cmdIdx == 2) {
             if (trackIdx < 0) {
@@ -447,7 +695,6 @@ public class MainActivity extends Activity {
             p.keyword = "LOOP";
             p.track = trackIdx;
             p.minutes = n;
-            p.text = "LOOP  trk" + trackIdx + "  " + n + " MIN";
             c = p;
         } else {
             if (trackIdx < 0) {
@@ -473,31 +720,19 @@ public class MainActivity extends Activity {
             if (mode == 0) {
                 p.timed = true;
                 p.minutes = n;
-                p.text = "SECTION  trk" + trackIdx + "  " + fmtMs(startMs) + " - "
-                        + fmtMs(endMs) + "  FOR " + n + " MIN";
             } else {
                 p.timed = false;
                 p.times = n;
-                p.text = "SECTION  trk" + trackIdx + "  " + fmtMs(startMs) + " - "
-                        + fmtMs(endMs) + "  " + n + " TIMES";
             }
             c = p;
         }
-        program.add(c);
+        c.text = CmdCodec.describe(c);
+        currentProgram().cmds.add(c);
         refreshProgramList();
-        setStatus("Added step " + program.size() + ".");
-    }
-
-    private void refreshProgramList() {
-        StringBuilder sb = new StringBuilder();
-        if (program.isEmpty()) {
-            sb.append("(no steps yet)\n");
-        } else {
-            for (int i = 0; i < program.size(); i++) {
-                sb.append(i + 1).append(". ").append(program.get(i).text).append('\n');
-            }
+        setStatus("Added step " + currentProgram().cmds.size() + ".");
+        if (SettingsActivity.autoSave(this)) {
+            Storage.savePrograms(this, programs);
         }
-        programListView.setText(sb.toString());
     }
 
     private void runProgram() {
@@ -505,282 +740,96 @@ public class MainActivity extends Activity {
             toastLong("Load at least one track first.");
             return;
         }
-        if (program.isEmpty()) {
+        if (currentProgram().cmds.isEmpty()) {
             toastShort("Add commands to the program first.");
             return;
         }
-        haltWorker();
-        running = true;
+        requestNotificationPermissionIfNeeded();
+        Intent si = new Intent(this, PlayerService.class);
+        si.setAction(PlayerService.ACTION_PLAY);
+        ArrayList<String> uris = new ArrayList<String>();
+        for (Uri u : tracks) uris.add(u.toString());
+        si.putStringArrayListExtra(PlayerService.EXTRA_TRACK_URIS, uris);
+        si.putStringArrayListExtra(PlayerService.EXTRA_TRACK_NAMES, new ArrayList<String>(trackNames));
+        si.putExtra(PlayerService.EXTRA_PROGRAM, CmdCodec.encodeProgram(currentProgram().cmds));
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(si);
+        } else {
+            startService(si);
+        }
+        setBuilderEnabled(false);
         runButton.setEnabled(false);
         stopButton.setEnabled(true);
-        addButton.setEnabled(false);
-        clearButton.setEnabled(false);
-        uiHandler.post(positionTicker);
-        final List<Cmd> snapshot = new ArrayList<Cmd>(program);
-        worker = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                executeProgram(snapshot);
-            }
-        }, "script-engine");
-        worker.start();
+        running = true;
+        setStatus("Starting playback...");
     }
 
-    private void haltWorker() {
+    private void stopProgram() {
+        Intent si = new Intent(this, PlayerService.class);
+        si.setAction(PlayerService.ACTION_STOP);
+        startService(si);
         running = false;
-        Thread w = worker;
-        if (w != null && w.isAlive()) {
-            w.interrupt();
-            try {
-                w.join(1500);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-        worker = null;
-        uiHandler.removeCallbacks(positionTicker);
-        releasePlayer();
-        resetUi();
-    }
-
-    private void executeProgram(List<Cmd> prog) {
-        String endMessage;
-        try {
-            for (int pc = 0; pc < prog.size() && running; pc++) {
-                Cmd cmd = prog.get(pc);
-                if (cmd.track >= 0 && cmd.track >= tracks.size()) {
-                    throw new IllegalArgumentException(cmd.keyword + ": track index "
-                            + cmd.track + " out of range (loaded: " + tracks.size() + ")");
-                }
-                setStatus("[" + pc + "/" + prog.size() + "] " + cmd.text);
-                if (cmd instanceof PlayCmd) {
-                    doPlay((PlayCmd) cmd);
-                } else if (cmd instanceof PauseCmd) {
-                    doPause((PauseCmd) cmd);
-                } else if (cmd instanceof LoopCmd) {
-                    doLoop((LoopCmd) cmd);
-                } else if (cmd instanceof SectionCmd) {
-                    doSection((SectionCmd) cmd);
-                }
-            }
-            endMessage = running ? "Program finished." : "Program halted.";
-        } catch (InterruptedException lost) {
-            endMessage = "Program halted.";
-        } catch (Exception ex) {
-            String msg = ex.getMessage();
-            endMessage = "ERROR: " + (msg == null ? ex.getClass().getSimpleName() : msg);
-        } finally {
-            releasePlayer();
-            running = false;
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    resetUi();
-                }
-            });
-        }
-        setStatus(endMessage);
-    }
-
-    private void doPlay(PlayCmd cmd) throws Exception {
-        for (int lap = 0; lap < cmd.times && running; lap++) {
-            MediaPlayer mp = prepareTrack(cmd.track, false);
-            playComplete = false;
-            playError = false;
-            mp.start();
-            awaitPlaybackDone();
-            if (playError) {
-                setStatus("Playback error on track " + cmd.track + " ("
-                        + trackNames.get(cmd.track) + ")");
-                break;
-            }
-            if (!running) {
-                quietStop(mp);
-            }
-        }
-    }
-
-    private void doPause(PauseCmd cmd) throws InterruptedException {
-        releasePlayer();
-        long deadline = SystemClock.elapsedRealtime() + cmd.minutes * 60000L;
-        while (running && SystemClock.elapsedRealtime() < deadline) {
-            Thread.sleep(250);
-        }
-    }
-
-    private void doLoop(LoopCmd cmd) throws Exception {
-        MediaPlayer mp = prepareTrack(cmd.track, true);
-        playError = false;
-        mp.start();
-        long deadline = SystemClock.elapsedRealtime() + cmd.minutes * 60000L;
-        while (running && SystemClock.elapsedRealtime() < deadline && !playError) {
-            Thread.sleep(200);
-        }
-        if (playError) {
-            setStatus("Playback error on track " + cmd.track);
-        }
-        if (running && !playError) {
-            quietStop(mp);
-        }
-    }
-
-    private void doSection(SectionCmd cmd) throws Exception {
-        MediaPlayer mp = prepareTrack(cmd.track, false);
-        playError = false;
-        playComplete = false;
-        seekDone = false;
-        mp.seekTo((int) cmd.startMs);
-        waitSeek();
-        if (!running || playError) {
-            if (running) quietStop(mp);
-            return;
-        }
-        mp.start();
-        long duration = mp.getDuration();
-        long startMs = cmd.startMs;
-        long endMs = cmd.endMs;
-        if (startMs > duration) startMs = 0;
-        if (endMs > duration) endMs = duration;
-        if (endMs <= startMs) {
-            startMs = 0;
-            endMs = duration;
-        }
-        long deadline = SystemClock.elapsedRealtime() + cmd.minutes * 60000L;
-        int laps = 0;
-        while (running && !playError) {
-            if (cmd.timed && SystemClock.elapsedRealtime() >= deadline) {
-                break;
-            }
-            if (!cmd.timed && laps >= cmd.times) {
-                break;
-            }
-            int pos = mp.getCurrentPosition();
-            if (pos + 50 >= (int) endMs) {
-                laps++;
-                if (!cmd.timed && laps >= cmd.times) {
-                    break;
-                }
-                seekDone = false;
-                mp.seekTo((int) startMs);
-                waitSeek();
-                if (running && !playError) {
-                    mp.start();
-                }
-            } else {
-                Thread.sleep(100);
-            }
-        }
-        if (playError) {
-            setStatus("Playback error on track " + cmd.track);
-        }
-        if (running && !playError) {
-            quietStop(mp);
-        }
-    }
-
-    private void awaitPlaybackDone() throws InterruptedException {
-        while (running && !playComplete && !playError) {
-            Thread.sleep(50);
-        }
-    }
-
-    private MediaPlayer prepareTrack(int index, boolean looping) throws Exception {
-        MediaPlayer mp = acquirePlayer();
-        synchronized (playerLock) {
-            mp.reset();
-            AudioAttributes attrs = new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build();
-            mp.setAudioAttributes(attrs);
-            mp.setLooping(looping);
-            mp.setDataSource(this, tracks.get(index));
-            mp.prepare();
-        }
-        return mp;
-    }
-
-    private void waitSeek() throws InterruptedException {
-        long waited = 0;
-        while (running && !seekDone && waited < 3000 && !playError) {
-            Thread.sleep(25);
-            waited += 25;
-        }
-    }
-
-    private MediaPlayer acquirePlayer() {
-        synchronized (playerLock) {
-            if (player == null) {
-                player = new MediaPlayer();
-                player.setOnSeekCompleteListener(new MediaPlayer.OnSeekCompleteListener() {
-                    @Override
-                    public void onSeekComplete(MediaPlayer mp) {
-                        seekDone = true;
-                    }
-                });
-                player.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
-                    @Override
-                    public void onCompletion(MediaPlayer mp) {
-                        playComplete = true;
-                    }
-                });
-                player.setOnErrorListener(new MediaPlayer.OnErrorListener() {
-                    @Override
-                    public boolean onError(MediaPlayer mp, int what, int extra) {
-                        playError = true;
-                        playComplete = true;
-                        return true;
-                    }
-                });
-            }
-            return player;
-        }
-    }
-
-    private void quietStop(MediaPlayer mp) {
-        try {
-            mp.stop();
-        } catch (Exception ignored) {
-        }
-    }
-
-    private void releasePlayer() {
-        synchronized (playerLock) {
-            MediaPlayer mp = player;
-            player = null;
-            if (mp != null) {
-                try {
-                    mp.stop();
-                } catch (Exception ignored) {
-                }
-                try {
-                    mp.reset();
-                } catch (Exception ignored) {
-                }
-                try {
-                    mp.release();
-                } catch (Exception ignored) {
-                }
-            }
-        }
-    }
-
-    private void resetUi() {
-        uiHandler.removeCallbacks(positionTicker);
-        positionView.setText("");
         runButton.setEnabled(true);
         stopButton.setEnabled(false);
-        addButton.setEnabled(true);
-        clearButton.setEnabled(true);
+        setBuilderEnabled(true);
+        setStatus("Stopping...");
+    }
+
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS},
+                        REQ_POST_NOTIFICATIONS);
+            }
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions,
+                                           int[] grantResults) {
+        if (requestCode == REQ_POST_NOTIFICATIONS) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                toastShort("Notifications enabled.");
+            } else {
+                toastShort("Enable notifications in system settings to see playback.");
+            }
+        }
+    }
+
+    private void exportProgram() {
+        Intent share = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        share.addCategory(Intent.CATEGORY_OPENABLE);
+        share.setType("text/plain");
+        share.putExtra(Intent.EXTRA_TITLE, currentProgram().name + ".pmp");
+        startActivityForResult(share, REQ_EXPORT);
+    }
+
+    private void importProgram() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("text/plain");
+        startActivityForResult(i, REQ_IMPORT);
+    }
+
+    private void setBuilderEnabled(boolean enabled) {
+        cmdSpinner.setEnabled(enabled);
+        trackSpinner.setEnabled(enabled);
+        nEdit.setEnabled(enabled);
+        startMinEdit.setEnabled(enabled);
+        startSecEdit.setEnabled(enabled);
+        endMinEdit.setEnabled(enabled);
+        endSecEdit.setEnabled(enabled);
+        addButton.setEnabled(enabled);
+        clearButton.setEnabled(enabled);
+        newButton.setEnabled(enabled);
+        deleteButton.setEnabled(enabled);
+        exportButton.setEnabled(enabled);
+        importButton.setEnabled(enabled);
     }
 
     private void setStatus(final String text) {
-        runOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                statusView.setText(text);
-            }
-        });
+        statusView.setText(text);
     }
 
     private void toastShort(String msg) {
@@ -809,45 +858,5 @@ public class MainActivity extends Activity {
         if (ms < 0) ms = 0;
         int total = ms / 1000;
         return String.format(Locale.US, "%d:%02d", total / 60, total % 60);
-    }
-
-    private static String fmtMs(long ms) {
-        if (ms < 0) ms = 0;
-        long total = ms / 1000;
-        return String.format(Locale.US, "%d:%02d", total / 60, total % 60);
-    }
-
-    @Override
-    protected void onDestroy() {
-        haltWorker();
-        super.onDestroy();
-    }
-
-    // ----- command model -----
-
-    static abstract class Cmd {
-        String keyword;
-        String text;
-        int track = -1;
-    }
-
-    static final class PlayCmd extends Cmd {
-        int times;
-    }
-
-    static final class PauseCmd extends Cmd {
-        long minutes;
-    }
-
-    static final class LoopCmd extends Cmd {
-        long minutes;
-    }
-
-    static final class SectionCmd extends Cmd {
-        long startMs;
-        long endMs;
-        boolean timed;
-        long minutes;
-        int times;
     }
 }
