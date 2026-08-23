@@ -1,0 +1,15 @@
+﻿# Build artifacts
+*.apk
+*.apk.idsig
+*.class
+classes.dex
+unaligned.apk
+riola.apk
+programmable-player.apk
+
+# Generated sources
+riola/com/example/player/R.java
+
+# OS / editor
+.DS_Store
+Thumbs.db
