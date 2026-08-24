@@ -7,9 +7,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
-        android:label="Programmable Music Player"
-        android:icon="@drawable/ic_launcher"
-        android:theme="@style/AppTheme">
+        android:label="Programmable Player"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <activity
             android:name=".MainActivity"
             android:exported="true"

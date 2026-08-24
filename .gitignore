@@ -6,11 +6,11 @@ classes.dex
 unaligned.apk
 riola.apk
 programmable-player.apk
+app-aligned.apk
+*.log
 
 # Generated sources
 riola/com/example/player/R.java
-com/
-compiled/
 
 # OS / editor
 .DS_Store

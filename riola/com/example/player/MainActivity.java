@@ -15,16 +15,18 @@ import android.os.Bundle;
 import android.provider.OpenableColumns;
 import android.text.InputType;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
-import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -45,22 +47,25 @@ public class MainActivity extends Activity {
     private final List<String> trackNames = new ArrayList<String>();
     private List<Program> programs = new ArrayList<Program>();
     private int currentProgramIndex = 0;
-
-    private boolean ignoreSpinnerEvents = false;
+    private boolean ignoreSpinner = false;
     private boolean running = false;
 
     private TextView trackListView;
     private TextView programListView;
     private TextView statusView;
     private TextView positionView;
+    private SeekBar volumeSeekBar;
 
     private Spinner programSpinner;
     private Spinner cmdSpinner;
     private Spinner trackSpinner;
     private Spinner sectionModeSpinner;
+    private CheckBox shuffleCheck;
     private LinearLayout sectionTimeRow;
     private LinearLayout sectionModeRow;
     private EditText nEdit;
+    private EditText repeatEdit;
+    private EditText sleepEdit;
     private EditText startMinEdit;
     private EditText startSecEdit;
     private EditText endMinEdit;
@@ -74,6 +79,9 @@ public class MainActivity extends Activity {
     private Button exportButton;
     private Button importButton;
     private Button settingsButton;
+    private Button shuffleAllButton;
+
+    private AudioManager audio;
 
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
         @Override
@@ -81,9 +89,9 @@ public class MainActivity extends Activity {
             String a = i.getAction();
             if (PlayerService.BROADCAST_STATUS.equals(a)) {
                 statusView.setText(i.getStringExtra("status"));
+                boolean playing = i.getBooleanExtra("playing", false);
                 int pos = i.getIntExtra("pos", 0);
                 int dur = i.getIntExtra("dur", 0);
-                boolean playing = i.getBooleanExtra("playing", false);
                 positionView.setText(playing ? (fmtTime(pos) + " / " + fmtTime(dur)) : "");
             } else if (PlayerService.BROADCAST_FINISHED.equals(a)) {
                 running = false;
@@ -99,13 +107,10 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        audio = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         if (SettingsActivity.keepScreenOn(this)) {
             getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        } else {
-            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         }
-        setVolumeControlStream(AudioManager.STREAM_MUSIC);
-
         float density = getResources().getDisplayMetrics().density;
         int pad = Math.round(16f * density);
 
@@ -116,23 +121,13 @@ public class MainActivity extends Activity {
         scroller.addView(root);
         setContentView(scroller);
 
-        // Header with logo + title
-        LinearLayout header = new LinearLayout(this);
-        header.setOrientation(LinearLayout.HORIZONTAL);
-        header.setGravity(Gravity.CENTER_VERTICAL);
-        ImageView logo = new ImageView(this);
-        logo.setImageDrawable(getDrawable(R.drawable.ic_launcher));
-        int logoW = Math.round(40f * density);
-        logo.setLayoutParams(new LinearLayout.LayoutParams(logoW, logoW));
         TextView title = new TextView(this);
         title.setText("Programmable Player");
-        title.setTextSize(19f);
-        title.setPadding(Math.round(10f * density), 0, 0, 0);
-        header.addView(logo);
-        header.addView(title);
-        root.addView(header);
+        title.setTextSize(20f);
+        title.setGravity(Gravity.CENTER);
+        title.setPadding(0, 0, 0, Math.round(8f * density));
+        root.addView(title);
 
-        // Tracks
         Button pickButton = new Button(this);
         pickButton.setText("Select Tracks");
         pickButton.setOnClickListener(new View.OnClickListener() {
@@ -150,7 +145,6 @@ public class MainActivity extends Activity {
         root.addView(trackScroller, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, Math.round(120f * density)));
 
-        // Programs bar
         LinearLayout progBar = new LinearLayout(this);
         progBar.setOrientation(LinearLayout.HORIZONTAL);
         programSpinner = new Spinner(this);
@@ -158,11 +152,8 @@ public class MainActivity extends Activity {
         programSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override
             public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
-                if (!ignoreSpinnerEvents) {
-                    switchProgram(pos);
-                }
+                if (!ignoreSpinner) switchProgram(pos);
             }
-
             @Override
             public void onNothingSelected(AdapterView<?> parent) {
             }
@@ -190,8 +181,8 @@ public class MainActivity extends Activity {
         progBar.addView(deleteButton, half);
         root.addView(progBar);
 
-        LinearLayout progActionRow = new LinearLayout(this);
-        progActionRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout progActions = new LinearLayout(this);
+        progActions.setOrientation(LinearLayout.HORIZONTAL);
         exportButton = new Button(this);
         exportButton.setText("Export");
         exportButton.setOnClickListener(new View.OnClickListener() {
@@ -216,10 +207,10 @@ public class MainActivity extends Activity {
                 startActivity(new Intent(MainActivity.this, SettingsActivity.class));
             }
         });
-        progActionRow.addView(exportButton, half);
-        progActionRow.addView(importButton, half);
-        progActionRow.addView(settingsButton, half);
-        root.addView(progActionRow);
+        progActions.addView(exportButton, half);
+        progActions.addView(importButton, half);
+        progActions.addView(settingsButton, half);
+        root.addView(progActions);
 
         TextView builderTitle = new TextView(this);
         builderTitle.setText("Build program (visual):");
@@ -241,7 +232,6 @@ public class MainActivity extends Activity {
             public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
                 applyFieldVisibility(pos);
             }
-
             @Override
             public void onNothingSelected(AdapterView<?> parent) {
             }
@@ -277,17 +267,41 @@ public class MainActivity extends Activity {
         sectionModeRow = new LinearLayout(this);
         sectionModeRow.setOrientation(LinearLayout.HORIZONTAL);
         TextView modeLabel = new TextView(this);
-        modeLabel.setText("Repeat");
+        modeLabel.setText("Repeat mode");
         sectionModeSpinner = new Spinner(this);
         ArrayAdapter<String> modeAdapter = new ArrayAdapter<String>(this,
                 android.R.layout.simple_spinner_item,
-                new ArrayList<String>(Arrays.asList("FOR MIN", "N TIMES")));
+                new ArrayList<String>(Arrays.asList("FOR MINUTES", "N TIMES")));
         modeAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         sectionModeSpinner.setAdapter(modeAdapter);
-        sectionModeSpinner.setSelection(0);
         sectionModeRow.addView(modeLabel, half);
         sectionModeRow.addView(sectionModeSpinner, half);
         root.addView(sectionModeRow);
+
+        LinearLayout repRow = new LinearLayout(this);
+        repRow.setOrientation(LinearLayout.HORIZONTAL);
+        TextView repLabel = new TextView(this);
+        repLabel.setText("Repeat program (0 = forever)");
+        repeatEdit = new EditText(this);
+        repeatEdit.setInputType(InputType.TYPE_CLASS_NUMBER);
+        repeatEdit.setText("0");
+        repRow.addView(repLabel, half);
+        repRow.addView(repeatEdit, half);
+        root.addView(repRow);
+
+        LinearLayout optRow = new LinearLayout(this);
+        optRow.setOrientation(LinearLayout.HORIZONTAL);
+        TextView sleepLabel = new TextView(this);
+        sleepLabel.setText("Sleep timer (min)");
+        sleepEdit = new EditText(this);
+        sleepEdit.setInputType(InputType.TYPE_CLASS_NUMBER);
+        sleepEdit.setText(String.valueOf(SettingsActivity.defaultSleepMin(this)));
+        shuffleCheck = new CheckBox(this);
+        shuffleCheck.setText("Shuffle order");
+        optRow.addView(sleepLabel, half);
+        optRow.addView(sleepEdit, half);
+        optRow.addView(shuffleCheck);
+        root.addView(optRow);
 
         LinearLayout actionRow = new LinearLayout(this);
         actionRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -307,14 +321,25 @@ public class MainActivity extends Activity {
                 currentProgram().cmds.clear();
                 refreshProgramList();
                 setStatus("Program cleared.");
-                if (SettingsActivity.autoSave(MainActivity.this)) {
-                    Storage.savePrograms(MainActivity.this, programs);
-                }
+                autoSave();
             }
         });
         actionRow.addView(addButton, half);
         actionRow.addView(clearButton, half);
         root.addView(actionRow);
+
+        shuffleAllButton = new Button(this);
+        shuffleAllButton.setText("Shuffle program");
+        shuffleAllButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                java.util.Collections.shuffle(currentProgram().cmds);
+                refreshProgramList();
+                setStatus("Shuffled.");
+                autoSave();
+            }
+        });
+        root.addView(shuffleAllButton);
 
         programListView = new TextView(this);
         programListView.setText("(no steps yet)\n");
@@ -322,6 +347,30 @@ public class MainActivity extends Activity {
         programScroller.addView(programListView);
         root.addView(programScroller, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, Math.round(180f * density)));
+
+        TextView volLabel = new TextView(this);
+        volLabel.setText("Media volume");
+        root.addView(volLabel);
+        volumeSeekBar = new SeekBar(this);
+        int maxVol = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        volumeSeekBar.setMax(maxVol);
+        volumeSeekBar.setProgress(audio.getStreamVolume(AudioManager.STREAM_MUSIC));
+        volumeSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (fromUser) {
+                    audio.setStreamVolume(AudioManager.STREAM_MUSIC, progress, AudioManager.FLAG_SHOW_UI);
+                }
+            }
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+            }
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+            }
+        });
+        root.addView(volumeSeekBar, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         positionView = new TextView(this);
         positionView.setText("");
@@ -357,7 +406,6 @@ public class MainActivity extends Activity {
         statusView.setTextSize(13f);
         root.addView(statusView);
 
-        // Load / initialize programs
         programs = Storage.loadPrograms(this);
         if (programs.isEmpty()) {
             programs.add(new Program("Program 1"));
@@ -368,13 +416,25 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+            audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI);
+            return true;
+        }
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+            audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI);
+            return true;
+        }
+        if (keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE) {
+            togglePlayback();
+            return true;
+        }
+        return super.onKeyDown(keyCode, event);
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
-        if (SettingsActivity.keepScreenOn(this)) {
-            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        } else {
-            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        }
         registerReceiver(statusReceiver, new IntentFilter(PlayerService.BROADCAST_STATUS));
         registerReceiver(statusReceiver, new IntentFilter(PlayerService.BROADCAST_FINISHED));
     }
@@ -396,6 +456,99 @@ public class MainActivity extends Activity {
             startService(si);
         }
         super.onDestroy();
+    }
+
+    private void togglePlayback() {
+        if (running) {
+            Intent si = new Intent(this, PlayerService.class);
+            si.setAction(PlayerService.ACTION_PAUSE);
+            startService(si);
+            setStatus("Pausing...");
+        } else {
+            Intent si = new Intent(this, PlayerService.class);
+            si.setAction(PlayerService.ACTION_RESUME);
+            startService(si);
+        }
+    }
+
+    private void runProgram() {
+        if (tracks.isEmpty()) {
+            toastLong("Load at least one track first.");
+            return;
+        }
+        if (currentProgram().cmds.isEmpty()) {
+            toastShort("Add commands to the program first.");
+            return;
+        }
+        requestNotificationPermissionIfNeeded();
+        Intent si = new Intent(this, PlayerService.class);
+        si.setAction(PlayerService.ACTION_PLAY);
+        ArrayList<String> uris = new ArrayList<String>();
+        for (Uri u : tracks) uris.add(u.toString());
+        si.putStringArrayListExtra(PlayerService.EXTRA_TRACK_URIS, uris);
+        si.putStringArrayListExtra(PlayerService.EXTRA_TRACK_NAMES, new ArrayList<String>(trackNames));
+        si.putExtra(PlayerService.EXTRA_PROGRAM, CmdCodec.encodeProgram(currentProgram().cmds));
+        si.putExtra(PlayerService.EXTRA_REPEAT, parseInt(repeatEdit, 0));
+        si.putExtra(PlayerService.EXTRA_SLEEP_MIN, parseInt(sleepEdit, 0));
+        si.putExtra(PlayerService.EXTRA_SHUFFLE, shuffleCheck.isChecked());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(si);
+        } else {
+            startService(si);
+        }
+        setBuilderEnabled(false);
+        runButton.setEnabled(false);
+        stopButton.setEnabled(true);
+        running = true;
+        setStatus("Starting playback...");
+    }
+
+    private void stopProgram() {
+        Intent si = new Intent(this, PlayerService.class);
+        si.setAction(PlayerService.ACTION_STOP);
+        startService(si);
+        running = false;
+        runButton.setEnabled(true);
+        stopButton.setEnabled(false);
+        setBuilderEnabled(true);
+        setStatus("Stopping...");
+    }
+
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS},
+                        REQ_POST_NOTIFICATIONS);
+            }
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions,
+                                           int[] grantResults) {
+        if (requestCode == REQ_POST_NOTIFICATIONS) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                toastShort("Notifications enabled.");
+            } else {
+                toastShort("Enable notifications in system settings to see playback.");
+            }
+        }
+    }
+
+    private void exportProgram() {
+        Intent share = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        share.addCategory(Intent.CATEGORY_OPENABLE);
+        share.setType("text/plain");
+        share.putExtra(Intent.EXTRA_TITLE, currentProgram().name + ".pmp");
+        startActivityForResult(share, REQ_EXPORT);
+    }
+
+    private void importProgram() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("text/plain");
+        startActivityForResult(i, REQ_IMPORT);
     }
 
     private EditText newNumberEdit(String value) {
@@ -444,10 +597,30 @@ public class MainActivity extends Activity {
                 android.R.layout.simple_spinner_item, names);
         a.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         programSpinner.setAdapter(a);
-        ignoreSpinnerEvents = true;
+        ignoreSpinner = true;
         programSpinner.setSelection(Math.min(currentProgramIndex, programs.size() - 1));
-        ignoreSpinnerEvents = false;
+        ignoreSpinner = false;
         refreshProgramList();
+    }
+
+    private void setBuilderEnabled(boolean enabled) {
+        cmdSpinner.setEnabled(enabled);
+        trackSpinner.setEnabled(enabled);
+        nEdit.setEnabled(enabled);
+        repeatEdit.setEnabled(enabled);
+        sleepEdit.setEnabled(enabled);
+        shuffleCheck.setEnabled(enabled);
+        shuffleAllButton.setEnabled(enabled);
+        startMinEdit.setEnabled(enabled);
+        startSecEdit.setEnabled(enabled);
+        endMinEdit.setEnabled(enabled);
+        endSecEdit.setEnabled(enabled);
+        addButton.setEnabled(enabled);
+        clearButton.setEnabled(enabled);
+        newButton.setEnabled(enabled);
+        deleteButton.setEnabled(enabled);
+        exportButton.setEnabled(enabled);
+        importButton.setEnabled(enabled);
     }
 
     private void switchProgram(int pos) {
@@ -465,12 +638,9 @@ public class MainActivity extends Activity {
             n++;
             name = base + " " + n;
         }
-        Program p = new Program(name);
-        programs.add(p);
+        programs.add(new Program(name));
         currentProgramIndex = programs.size() - 1;
-        if (SettingsActivity.autoSave(this)) {
-            Storage.savePrograms(this, programs);
-        }
+        autoSave();
         refreshProgramSpinner();
         applyFieldVisibility(cmdSpinner.getSelectedItemPosition());
         setStatus("Created new program.");
@@ -491,9 +661,7 @@ public class MainActivity extends Activity {
         String removed = currentProgram().name;
         programs.remove(currentProgramIndex);
         if (currentProgramIndex >= programs.size()) currentProgramIndex = programs.size() - 1;
-        if (SettingsActivity.autoSave(this)) {
-            Storage.savePrograms(this, programs);
-        }
+        autoSave();
         refreshProgramSpinner();
         setStatus("Deleted '" + removed + "'.");
     }
@@ -509,6 +677,68 @@ public class MainActivity extends Activity {
             }
         }
         programListView.setText(sb.toString());
+    }
+
+    private void addStep() {
+        int cmdIdx = cmdSpinner.getSelectedItemPosition();
+        int trackIdx = tracks.isEmpty() ? -1 : trackSpinner.getSelectedItemPosition();
+        int n = parseInt(nEdit, 0);
+        if (n < 0) n = 0;
+
+        Cmd c;
+        if (cmdIdx == 0) {
+            if (trackIdx < 0) { toastShort("Pick a track first."); return; }
+            if (n < 1) { toastShort("N must be >= 1."); return; }
+            PlayCmd p = new PlayCmd();
+            p.keyword = "PLAY";
+            p.track = trackIdx;
+            p.times = n;
+            c = p;
+        } else if (cmdIdx == 1) {
+            PauseCmd p = new PauseCmd();
+            p.keyword = "PAUSE";
+            p.minutes = n;
+            c = p;
+        } else if (cmdIdx == 2) {
+            if (trackIdx < 0) { toastShort("Pick a track first."); return; }
+            if (n < 1) { toastShort("N must be >= 1."); return; }
+            LoopCmd p = new LoopCmd();
+            p.keyword = "LOOP";
+            p.track = trackIdx;
+            p.minutes = n;
+            c = p;
+        } else {
+            if (trackIdx < 0) { toastShort("Pick a track first."); return; }
+            int sm = clamp09(parseInt(startMinEdit, 0), 0, 59);
+            int ss = clamp09(parseInt(startSecEdit, 0), 0, 59);
+            int em = clamp09(parseInt(endMinEdit, 0), 0, 59);
+            int es = clamp09(parseInt(endSecEdit, 0), 0, 59);
+            long startMs = (sm * 60L + ss) * 1000L;
+            long endMs = (em * 60L + es) * 1000L;
+            if (endMs <= startMs) {
+                toastShort("End must be after start.");
+                return;
+            }
+            int mode = sectionModeSpinner.getSelectedItemPosition();
+            SectionCmd p = new SectionCmd();
+            p.keyword = "SECTION";
+            p.track = trackIdx;
+            p.startMs = startMs;
+            p.endMs = endMs;
+            if (mode == 0) {
+                p.timed = true;
+                p.minutes = n;
+            } else {
+                p.timed = false;
+                p.times = n;
+            }
+            c = p;
+        }
+        c.text = CmdCodec.describe(c);
+        currentProgram().cmds.add(c);
+        refreshProgramList();
+        setStatus("Added step " + currentProgram().cmds.size() + ".");
+        autoSave();
     }
 
     private void launchPicker() {
@@ -578,9 +808,7 @@ public class MainActivity extends Activity {
                 p.cmds = cmds;
                 programs.add(p);
                 currentProgramIndex = programs.size() - 1;
-                if (SettingsActivity.autoSave(this)) {
-                    Storage.savePrograms(this, programs);
-                }
+                autoSave();
                 refreshProgramSpinner();
                 toastShort("Imported " + cmds.size() + " commands as '" + name + "'.");
             } catch (Exception e) {
@@ -656,176 +884,10 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void addStep() {
-        int cmdIdx = cmdSpinner.getSelectedItemPosition();
-        int trackIdx = tracks.isEmpty() ? -1 : trackSpinner.getSelectedItemPosition();
-        int n = parseIntSafe(nEdit);
-        if (n < 0) n = 0;
-
-        Cmd c;
-        if (cmdIdx == 0) {
-            if (trackIdx < 0) {
-                toastShort("Pick a track first.");
-                return;
-            }
-            if (n < 1) {
-                toastShort("N must be >= 1.");
-                return;
-            }
-            PlayCmd p = new PlayCmd();
-            p.keyword = "PLAY";
-            p.track = trackIdx;
-            p.times = n;
-            c = p;
-        } else if (cmdIdx == 1) {
-            PauseCmd p = new PauseCmd();
-            p.keyword = "PAUSE";
-            p.minutes = n;
-            c = p;
-        } else if (cmdIdx == 2) {
-            if (trackIdx < 0) {
-                toastShort("Pick a track first.");
-                return;
-            }
-            if (n < 1) {
-                toastShort("N must be >= 1.");
-                return;
-            }
-            LoopCmd p = new LoopCmd();
-            p.keyword = "LOOP";
-            p.track = trackIdx;
-            p.minutes = n;
-            c = p;
-        } else {
-            if (trackIdx < 0) {
-                toastShort("Pick a track first.");
-                return;
-            }
-            int sm = clamp09(parseIntSafe(startMinEdit), 0, 59);
-            int ss = clamp09(parseIntSafe(startSecEdit), 0, 59);
-            int em = clamp09(parseIntSafe(endMinEdit), 0, 59);
-            int es = clamp09(parseIntSafe(endSecEdit), 0, 59);
-            long startMs = (sm * 60L + ss) * 1000L;
-            long endMs = (em * 60L + es) * 1000L;
-            if (endMs <= startMs) {
-                toastShort("End must be after start.");
-                return;
-            }
-            int mode = sectionModeSpinner.getSelectedItemPosition();
-            SectionCmd p = new SectionCmd();
-            p.keyword = "SECTION";
-            p.track = trackIdx;
-            p.startMs = startMs;
-            p.endMs = endMs;
-            if (mode == 0) {
-                p.timed = true;
-                p.minutes = n;
-            } else {
-                p.timed = false;
-                p.times = n;
-            }
-            c = p;
-        }
-        c.text = CmdCodec.describe(c);
-        currentProgram().cmds.add(c);
-        refreshProgramList();
-        setStatus("Added step " + currentProgram().cmds.size() + ".");
+    private void autoSave() {
         if (SettingsActivity.autoSave(this)) {
             Storage.savePrograms(this, programs);
         }
-    }
-
-    private void runProgram() {
-        if (tracks.isEmpty()) {
-            toastLong("Load at least one track first.");
-            return;
-        }
-        if (currentProgram().cmds.isEmpty()) {
-            toastShort("Add commands to the program first.");
-            return;
-        }
-        requestNotificationPermissionIfNeeded();
-        Intent si = new Intent(this, PlayerService.class);
-        si.setAction(PlayerService.ACTION_PLAY);
-        ArrayList<String> uris = new ArrayList<String>();
-        for (Uri u : tracks) uris.add(u.toString());
-        si.putStringArrayListExtra(PlayerService.EXTRA_TRACK_URIS, uris);
-        si.putStringArrayListExtra(PlayerService.EXTRA_TRACK_NAMES, new ArrayList<String>(trackNames));
-        si.putExtra(PlayerService.EXTRA_PROGRAM, CmdCodec.encodeProgram(currentProgram().cmds));
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(si);
-        } else {
-            startService(si);
-        }
-        setBuilderEnabled(false);
-        runButton.setEnabled(false);
-        stopButton.setEnabled(true);
-        running = true;
-        setStatus("Starting playback...");
-    }
-
-    private void stopProgram() {
-        Intent si = new Intent(this, PlayerService.class);
-        si.setAction(PlayerService.ACTION_STOP);
-        startService(si);
-        running = false;
-        runButton.setEnabled(true);
-        stopButton.setEnabled(false);
-        setBuilderEnabled(true);
-        setStatus("Stopping...");
-    }
-
-    private void requestNotificationPermissionIfNeeded() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
-                    != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS},
-                        REQ_POST_NOTIFICATIONS);
-            }
-        }
-    }
-
-    @Override
-    public void onRequestPermissionsResult(int requestCode, String[] permissions,
-                                           int[] grantResults) {
-        if (requestCode == REQ_POST_NOTIFICATIONS) {
-            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                toastShort("Notifications enabled.");
-            } else {
-                toastShort("Enable notifications in system settings to see playback.");
-            }
-        }
-    }
-
-    private void exportProgram() {
-        Intent share = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-        share.addCategory(Intent.CATEGORY_OPENABLE);
-        share.setType("text/plain");
-        share.putExtra(Intent.EXTRA_TITLE, currentProgram().name + ".pmp");
-        startActivityForResult(share, REQ_EXPORT);
-    }
-
-    private void importProgram() {
-        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        i.addCategory(Intent.CATEGORY_OPENABLE);
-        i.setType("text/plain");
-        startActivityForResult(i, REQ_IMPORT);
-    }
-
-    private void setBuilderEnabled(boolean enabled) {
-        cmdSpinner.setEnabled(enabled);
-        trackSpinner.setEnabled(enabled);
-        nEdit.setEnabled(enabled);
-        startMinEdit.setEnabled(enabled);
-        startSecEdit.setEnabled(enabled);
-        endMinEdit.setEnabled(enabled);
-        endSecEdit.setEnabled(enabled);
-        addButton.setEnabled(enabled);
-        clearButton.setEnabled(enabled);
-        newButton.setEnabled(enabled);
-        deleteButton.setEnabled(enabled);
-        exportButton.setEnabled(enabled);
-        importButton.setEnabled(enabled);
     }
 
     private void setStatus(final String text) {
@@ -840,11 +902,15 @@ public class MainActivity extends Activity {
         Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
     }
 
-    private static int parseIntSafe(EditText et) {
+    private static int parseInt(EditText et, int def) {
+        return parseInt(et.getText().toString(), def);
+    }
+
+    private static int parseInt(String s, int def) {
         try {
-            return Integer.parseInt(et.getText().toString().trim());
+            return Integer.parseInt(s.trim());
         } catch (Exception e) {
-            return 0;
+            return def;
         }
     }
 
