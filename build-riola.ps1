@@ -180,6 +180,20 @@ Write-Src 'res\values\strings.xml' @'
 </resources>
 '@
 
+Write-Src 'res\values\styles.xml' @'
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The stock dialog scrim is barely there, which makes a modal sheet read
+         as part of the page behind it. -->
+    <style name="RiolaDialog" parent="@android:style/Theme.Material.Dialog.Alert">
+        <item name="android:backgroundDimAmount">0.62</item>
+    </style>
+    <style name="RiolaDialogLight" parent="@android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:backgroundDimAmount">0.55</item>
+    </style>
+</resources>
+'@
+
 Write-Src 'res\mipmap-anydpi-v26\ic_launcher.xml' @'
 <?xml version="1.0" encoding="utf-8"?>
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
@@ -409,6 +423,7 @@ public class Step {
     public int speedPct = 100;
     public int volumePct = 100;
     public int tone = Bell.WARM;    // bell voice
+    public boolean endBell = false; // a silence can chime when it finishes
     public boolean enabled = true;
 
     public static Step play(Track t) {
@@ -473,6 +488,7 @@ public class Step {
         StringBuilder sb = new StringBuilder();
         if (type == SILENCE) {
             sb.append("rest for ").append(Fmt.rough(durMs));
+            if (endBell) sb.append("  .  ").append(Bell.toneName(tone)).append(" bell at the end");
             return sb.toString();
         }
         if (type == BELL) {
@@ -525,7 +541,8 @@ public class Step {
         Step s = new Step();
         s.type = type; s.trackUri = trackUri; s.trackName = trackName;
         s.a = a; s.b = b; s.times = times; s.durMs = durMs; s.gapMs = gapMs;
-        s.speedPct = speedPct; s.volumePct = volumePct; s.tone = tone; s.enabled = enabled;
+        s.speedPct = speedPct; s.volumePct = volumePct; s.tone = tone;
+        s.endBell = endBell; s.enabled = enabled;
         return s;
     }
 
@@ -542,6 +559,7 @@ public class Step {
         o.put("sp", speedPct);
         o.put("vo", volumePct);
         o.put("to", tone);
+        o.put("eb", endBell);
         o.put("en", enabled);
         return o;
     }
@@ -559,6 +577,7 @@ public class Step {
         s.speedPct = o.optInt("sp", 100);
         s.volumePct = o.optInt("vo", 100);
         s.tone = o.optInt("to", Bell.WARM);
+        s.endBell = o.optBoolean("eb", false);
         s.enabled = o.optBoolean("en", true);
         return s;
     }
@@ -968,8 +987,7 @@ public final class Ui {
     }
 
     public static AlertDialog.Builder dialog(Activity a) {
-        return new AlertDialog.Builder(a, dark ? android.R.style.Theme_Material_Dialog_Alert
-                                               : android.R.style.Theme_Material_Light_Dialog_Alert);
+        return new AlertDialog.Builder(a, dark ? R.style.RiolaDialog : R.style.RiolaDialogLight);
     }
 
     public static void toast(Context c, String s) { Toast.makeText(c, s, Toast.LENGTH_SHORT).show(); }
@@ -2210,6 +2228,9 @@ public class Engine {
             if (s.type == Step.SILENCE) {
                 pausePlayer();
                 silence(s.durMs, rest, true);
+                // the chime rings on into whatever comes next, which is exactly
+                // what you want when the next step is more silence
+                if (s.endBell && !stopReq && skip == 0) bell.ring(s.tone, vol * stepVol * duck);
             } else if (s.type == Step.BELL) {
                 pausePlayer();
                 bellStep(s, rest);
@@ -4018,6 +4039,8 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
     private Program prog;
 
     private LinearLayout stepsBox, loopBox;
+    private android.widget.ScrollView scroller;
+    private int liveRow = -1;
     private TextView titleView, subView, totalBadge;
     private final List<View> rows = new ArrayList<View>();
     private boolean dirty;
@@ -4117,11 +4140,29 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
         body.addView(card);
 
         body.addView(Ui.gap(this, 6));
-        root.addView(Ui.scroller(this, body));
+        scroller = Ui.scroller(this, body);
+        root.addView(scroller);
 
         bar = new PlayerBar(this, this);
         root.addView(bar.view);
         return root;
+    }
+
+    /** Keep the playing step on screen in a long program. */
+    private void scrollToRow(final View row) {
+        if (scroller == null || row == null) return;
+        scroller.post(new Runnable() {
+            public void run() {
+                int y = 0;
+                View v = row;
+                while (v != null && v.getParent() instanceof View && v.getParent() != scroller) {
+                    y += v.getTop();
+                    v = (View) v.getParent();
+                }
+                if (v != null) y += v.getTop();
+                scroller.smoothScrollTo(0, Math.max(0, y - Ui.dp(EditorActivity.this, 150)));
+            }
+        });
     }
 
     private void refresh() {
@@ -4275,15 +4316,19 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
     // ======================================================================
     // actions
     // ======================================================================
-    private void addStep() {
+    private void addStep() { addStep(-1); }
+
+    /** at < 0 appends; otherwise the new step lands at that index. */
+    private void addStep(final int at) {
         final String[] items = { "Whole track", "Section of a track", "Silence", "Bell" };
-        Ui.dialog(this).setTitle("Add step").setItems(items, new DialogInterface.OnClickListener() {
+        Ui.dialog(this).setTitle(at < 0 ? "Add step" : "Insert step").setItems(items,
+                new DialogInterface.OnClickListener() {
             public void onClick(DialogInterface d, int which) {
                 if (which == 2 || which == 3) {
-                    prog.steps.add(which == 2 ? Step.silence(60000) : Step.bell());
+                    int where = place(which == 2 ? Step.silence(60000) : Step.bell(), at);
                     save();
                     refresh();
-                    edit(prog.steps.size() - 1);
+                    edit(where);
                     return;
                 }
                 final boolean section = which == 1;
@@ -4299,14 +4344,23 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
                         } else {
                             s = Step.play(t);
                         }
-                        prog.steps.add(s);
+                        int where = place(s, at);
                         save();
                         refresh();
-                        edit(prog.steps.size() - 1);
+                        edit(where);
                     }
                 });
             }
         }).show();
+    }
+
+    private int place(Step s, int at) {
+        if (at < 0 || at > prog.steps.size()) {
+            prog.steps.add(s);
+            return prog.steps.size() - 1;
+        }
+        prog.steps.add(at, s);
+        return at;
     }
 
     private void edit(final int index) {
@@ -4321,16 +4375,17 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
         if (index < 0 || index >= prog.steps.size()) return;
         final Step s = prog.steps.get(index);
         final String[] items = { "Edit", "Play from here", s.enabled ? "Turn off" : "Turn on",
-                                 "Duplicate", "Move up", "Move down", "Delete" };
+                                 "Insert a step below", "Duplicate", "Move up", "Move down", "Delete" };
         Ui.dialog(this).setTitle(s.title()).setItems(items, new DialogInterface.OnClickListener() {
             public void onClick(DialogInterface d, int which) {
                 switch (which) {
                     case 0: edit(index); break;
                     case 1: run(index); break;
                     case 2: s.enabled = !s.enabled; save(); refresh(); break;
-                    case 3: prog.steps.add(index + 1, s.copy()); save(); refresh(); break;
-                    case 4: move(index, -1); break;
-                    case 5: move(index, 1); break;
+                    case 3: addStep(index + 1); break;
+                    case 4: prog.steps.add(index + 1, s.copy()); save(); refresh(); break;
+                    case 5: move(index, -1); break;
+                    case 6: move(index, 1); break;
                     default: removeStep(index);
                 }
             }
@@ -4397,11 +4452,18 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
     // ======================================================================
     public void onEngineState(Engine.St s) {
         if (prog == null) return;
+        boolean mine = s.running && prog.id.equals(s.programId);
         for (int i = 0; i < rows.size(); i++) {
-            boolean live = s.running && prog.id.equals(s.programId) && s.step == i;
+            boolean live = mine && s.step == i;
             rows.get(i).setBackground(live
                     ? Ui.rrs(this, Ui.dark ? 0xFF10202B : 0xFFE3F2FB, Ui.ACC, 14, 1.4f)
                     : Ui.ripple(Ui.rr(this, Ui.SURF2, 14)));
+        }
+        if (mine && s.step != liveRow) {
+            liveRow = s.step;
+            if (s.step >= 0 && s.step < rows.size()) scrollToRow(rows.get(s.step));
+        } else if (!mine) {
+            liveRow = -1;
         }
     }
 
@@ -4555,6 +4617,26 @@ public final class StepSheet {
                     });
                 }
             }));
+
+            box.addView(Ui.gap(a, 6));
+            box.addView(Ui.switchRow(a, "End with a bell", "chime when the rest is over",
+                    step.endBell, new Ui.OnToggle() {
+                public void set(boolean v) {
+                    step.endBell = v;
+                    if (v) Bell.preview(step.tone, 1f);
+                    again.run();
+                }
+            }));
+            if (step.endBell) {
+                box.addView(Ui.seg(a, new String[]{ "Low", "Warm", "Bright" }, Bell.clamp(step.tone),
+                        new Ui.OnPick() {
+                    public void set(int i) {
+                        step.tone = i;
+                        Bell.preview(i, 1f);
+                        again.run();
+                    }
+                }));
+            }
 
         } else if (step.type == Step.BELL) {
             box.addView(Ui.tv(a, "TONE", 11, Ui.DIM, true));
