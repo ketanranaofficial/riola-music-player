@@ -1134,8 +1134,17 @@ public final class Ui {
     }
 
     // ---- composite rows --------------------------------------------------
+    /** What appBar hands back, so callers never index into its children. */
+    public static class Bar {
+        public LinearLayout view;
+        public LinearLayout titles;
+        public TextView title;
+        public TextView sub;
+    }
+
     /** Screen header: optional back arrow, title, subtitle, trailing action views. */
-    public static LinearLayout appBar(final Activity a, int icoId, String title, String sub, boolean back, View[] actions) {
+    public static Bar appBar(final Activity a, int icoId, String title, String sub, boolean back, View[] actions) {
+        Bar bar = new Bar();
         LinearLayout h = row(a);
         h.setPadding(dp(a, back ? 4 : 16), dp(a, 12), dp(a, 8), dp(a, 8));
         if (back) {
@@ -1156,14 +1165,19 @@ public final class Ui {
         TextView t = tv(a, title, back ? 17 : 20, TXT, true);
         ellipsize(t);
         titles.addView(t);
-        if (sub != null && sub.length() > 0) {
-            TextView s = tv(a, sub, 11, DIM, false);
-            ellipsize(s);
-            titles.addView(s);
-        }
+        // The subtitle view is always created, even when it starts empty, so a
+        // screen can fill it in later.
+        TextView s = tv(a, sub == null ? "" : sub, 11, DIM, false);
+        ellipsize(s);
+        titles.addView(s);
         h.addView(titles);
         if (actions != null) for (View v : actions) if (v != null) h.addView(v);
-        return h;
+
+        bar.view = h;
+        bar.titles = titles;
+        bar.title = t;
+        bar.sub = s;
+        return bar;
     }
 
     public static LinearLayout emptyState(Context c, int icoId, String title, String body) {
@@ -3070,7 +3084,7 @@ public class MainActivity extends Activity implements PlayerBar.Host {
                 public void onClick(View v) { settings(); }
             })
         };
-        root.addView(Ui.appBar(this, Ico.NOTE, "Riola", "programmable music player", false, actions));
+        root.addView(Ui.appBar(this, Ico.NOTE, "Riola", "programmable music player", false, actions).view);
 
         LinearLayout body = Ui.col(this);
 
@@ -3544,14 +3558,13 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
                 public void onClick(View v) { menu(); }
             })
         };
-        LinearLayout header = Ui.appBar(this, 0, prog.name, prog.summary(), true, actions);
-        LinearLayout titles = (LinearLayout) header.getChildAt(1);
-        titleView = (TextView) titles.getChildAt(0);
-        subView = (TextView) titles.getChildAt(1);
-        titles.setOnClickListener(new View.OnClickListener() {
+        Ui.Bar header = Ui.appBar(this, 0, prog.name, prog.summary(), true, actions);
+        titleView = header.title;
+        subView = header.sub;
+        header.titles.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) { rename(); }
         });
-        root.addView(header);
+        root.addView(header.view);
 
         LinearLayout body = Ui.col(this);
 
@@ -4103,10 +4116,9 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
         root.setBackgroundColor(Ui.BG);
         root.setFitsSystemWindows(true);
 
-        LinearLayout header = Ui.appBar(this, 0, "Tracks", "", true, null);
-        LinearLayout titles = (LinearLayout) header.getChildAt(1);
-        subtitle = (TextView) titles.getChildAt(1);
-        root.addView(header);
+        Ui.Bar header = Ui.appBar(this, 0, "Tracks", "", true, null);
+        subtitle = header.sub;
+        root.addView(header.view);
 
         LinearLayout body = Ui.col(this);
 
