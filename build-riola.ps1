@@ -2950,6 +2950,10 @@ public class PlayerBar implements Engine.Listener {
         view = Ui.col(a);
         view.setBackgroundColor(Ui.SURF);
         view.setVisibility(View.GONE);
+        // consume its own touches: nothing behind the bar should ever react to
+        // a drag that started on the scrubber
+        view.setClickable(true);
+        view.setFocusable(true);
 
         View top = new View(a);
         top.setLayoutParams(Ui.lp(Ui.MATCH, Math.max(1, Ui.dp(a, 0.7f))));
@@ -3207,10 +3211,12 @@ public final class Runner {
                 if (nm == null || nm.areNotificationsEnabled()) return;
                 prefs.notifNagged(true);
                 Ui.dialog(a)
-                        .setTitle("No playback controls")
-                        .setMessage("Notifications are switched off for Riola, so while a program runs "
-                                + "there is no notification and no lock screen controls. The program "
-                                + "itself plays normally. You can switch them on in Android settings.")
+                        .setTitle("Notifications are off")
+                        .setMessage("Riola cannot show its playback notification, so its controls will "
+                                + "not appear in the notification shade. The program still plays "
+                                + "normally, and your phone's own media controls may still work. "
+                                + "Some phones switch notifications off for apps installed outside "
+                                + "the store. You can turn them back on in Android settings.")
                         .setNegativeButton("Not now", null)
                         .setPositiveButton("Open settings", new DialogInterface.OnClickListener() {
                             public void onClick(DialogInterface d, int w) {
@@ -4015,6 +4021,12 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
     private TextView titleView, subView, totalBadge;
     private final List<View> rows = new ArrayList<View>();
     private boolean dirty;
+    private Step undoStep;          // last deleted, kept briefly so it can come back
+    private int undoAt = -1;
+    private final android.os.Handler ui = new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable clearUndo = new Runnable() {
+        public void run() { undoStep = null; undoAt = -1; refresh(); }
+    };
 
     @Override
     protected void onCreate(Bundle saved) {
@@ -4134,7 +4146,12 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
             t.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
             r.addView(t);
             LinearLayout st = Ui.stepper(this, Math.max(2, prog.loops), 2, 99, 1, "x", new Ui.OnValue() {
-                public void set(int v) { prog.loops = v; save(); subView.setText(prog.summary()); }
+                public void set(int v) {
+                    prog.loops = v;
+                    save();
+                    subView.setText(prog.summary());
+                    totalBadge.setText(Fmt.rough(prog.estMs()));
+                }
             });
             st.setLayoutParams(Ui.lp(Ui.dp(this, 160), Ui.WRAP));
             r.addView(st);
@@ -4143,6 +4160,7 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
 
         stepsBox.removeAllViews();
         rows.clear();
+        if (undoStep != null) stepsBox.addView(undoBar());
         if (prog.steps.isEmpty()) {
             stepsBox.addView(Ui.emptyState(this, Ico.LIST, "No steps yet",
                     "Add a whole track, a section of a track, or a stretch of silence."));
@@ -4150,6 +4168,39 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
             for (int i = 0; i < prog.steps.size(); i++) stepsBox.addView(stepRow(i));
         }
         bar.render(eng.st);
+    }
+
+    /** A short lived "step removed - undo" strip, friendlier than a confirm dialog. */
+    private View undoBar() {
+        LinearLayout r = Ui.row(this);
+        r.setBackground(Ui.rrs(this, Ui.SURF2, Ui.AMBER, 12, 1));
+        r.setPadding(Ui.dp(this, 12), Ui.dp(this, 10), Ui.dp(this, 8), Ui.dp(this, 10));
+        Ui.margin(this, r, 0, 0, 0, 8);
+        TextView t = Ui.tv(this, "Step removed", 13, Ui.TXT, false);
+        t.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        r.addView(t);
+        r.addView(Ui.btn(this, "Undo", Ico.RESET, Ui.SECONDARY, new View.OnClickListener() {
+            public void onClick(View v) {
+                if (undoStep == null) return;
+                int at = Math.max(0, Math.min(undoAt, prog.steps.size()));
+                prog.steps.add(at, undoStep);
+                undoStep = null;
+                undoAt = -1;
+                ui.removeCallbacks(clearUndo);
+                save();
+                refresh();
+            }
+        }));
+        return r;
+    }
+
+    private void removeStep(int index) {
+        undoStep = prog.steps.remove(index);
+        undoAt = index;
+        ui.removeCallbacks(clearUndo);
+        ui.postDelayed(clearUndo, 8000);
+        save();
+        refresh();
     }
 
     private View stepRow(final int index) {
@@ -4163,7 +4214,12 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
         r.setPadding(Ui.dp(this, 8), Ui.dp(this, 9), Ui.dp(this, 2), Ui.dp(this, 9));
         Ui.margin(this, r, 0, 0, 0, 8);
         r.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) { edit(index); }
+            public void onClick(View v) {
+                // While this program is playing, a tap means "go here" - which is
+                // what the guide promises. Editing stays on the menu.
+                if (eng.isPlaying(prog)) { Ui.buzz(v); eng.jumpTo(index); }
+                else edit(index);
+            }
         });
         r.setOnLongClickListener(new View.OnLongClickListener() {
             public boolean onLongClick(View v) { stepMenu(index); return true; }
@@ -4257,6 +4313,7 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
         if (index < 0 || index >= prog.steps.size()) return;
         StepSheet.show(this, prog, index, new StepSheet.OnDone() {
             public void changed() { save(); refresh(); }
+            public void deleted(int at) { removeStep(at); }
         });
     }
 
@@ -4274,11 +4331,7 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
                     case 3: prog.steps.add(index + 1, s.copy()); save(); refresh(); break;
                     case 4: move(index, -1); break;
                     case 5: move(index, 1); break;
-                    default:
-                        prog.steps.remove(index);
-                        save();
-                        refresh();
-                        Ui.toast(EditorActivity.this, "Step removed");
+                    default: removeStep(index);
                 }
             }
         }).show();
@@ -4370,7 +4423,10 @@ import android.widget.TextView;
 /** The editor for a single step. Everything is tapped, nothing is typed. */
 public final class StepSheet {
 
-    public interface OnDone { void changed(); }
+    public interface OnDone {
+        void changed();
+        void deleted(int index);
+    }
 
     private StepSheet() { }
 
@@ -4398,11 +4454,7 @@ public final class StepSheet {
         Ui.dialog(a).setTitle("Step " + (index + 1) + "  -  " + kind)
                 .setView(sv)
                 .setNeutralButton("Delete", new DialogInterface.OnClickListener() {
-                    public void onClick(DialogInterface d, int w) {
-                        prog.steps.remove(index);
-                        cb.changed();
-                        Ui.toast(a, "Step removed");
-                    }
+                    public void onClick(DialogInterface d, int w) { cb.deleted(index); }
                 })
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Save", new DialogInterface.OnClickListener() {
