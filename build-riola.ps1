@@ -367,12 +367,24 @@ public class Track {
 
     public Uri toUri() { return Uri.parse(uri); }
 
+    /**
+     * The name without its file extension. Only a known audio extension is
+     * stripped: guessing from "the last dot" quietly ate names like
+     * "Soundarya_Lahari_(getmp3.pro)".
+     */
     public String shortTitle() {
         String t = title == null ? "" : title;
-        int dot = t.lastIndexOf('.');
-        if (dot > 0 && t.length() - dot <= 6) t = t.substring(0, dot);
+        String low = t.toLowerCase();
+        for (int i = 0; i < EXTS.length; i++) {
+            if (low.endsWith(EXTS[i]) && t.length() > EXTS[i].length()) {
+                return t.substring(0, t.length() - EXTS[i].length());
+            }
+        }
         return t;
     }
+
+    private static final String[] EXTS = { ".mp3", ".m4a", ".aac", ".wav", ".ogg", ".oga",
+            ".opus", ".flac", ".mp4", ".mka", ".wma", ".aif", ".aiff", ".mid", ".amr", ".3gp" };
 }
 '@
 
@@ -384,18 +396,19 @@ import org.json.JSONObject;
 /** One step of a program. Tracks are referenced by uri so reordering the library is safe. */
 public class Step {
 
-    public static final int PLAY = 0, SECTION = 1, SILENCE = 2;
+    public static final int PLAY = 0, SECTION = 1, SILENCE = 2, BELL = 3;
 
     public int type = PLAY;
     public String trackUri = "";
     public String trackName = "";   // remembered so a missing file still reads sensibly
     public long a = 0;              // section start
     public long b = -1;             // section end, -1 = end of track
-    public int times = 1;           // -1 = run until durMs is used up
+    public int times = 1;           // -1 = run until durMs is used up; strikes for a bell
     public long durMs = 0;          // silence length, or the time budget when times < 0
-    public long gapMs = 0;          // rest between repeats
+    public long gapMs = 0;          // rest between repeats / between bell strikes
     public int speedPct = 100;
     public int volumePct = 100;
+    public int tone = Bell.WARM;    // bell voice
     public boolean enabled = true;
 
     public static Step play(Track t) {
@@ -421,20 +434,35 @@ public class Step {
         return s;
     }
 
+    public static Step bell() {
+        Step s = new Step();
+        s.type = BELL;
+        s.tone = Bell.WARM;
+        s.times = 1;
+        s.gapMs = 4000;
+        return s;
+    }
+
     public void bind(Track t) {
         if (t == null) return;
         trackUri = t.uri;
         trackName = t.shortTitle();
     }
 
-    public Track track() { return type == SILENCE ? null : Store.byUri(trackUri); }
+    public boolean needsTrack() { return type == PLAY || type == SECTION; }
 
-    public boolean missing() { return type != SILENCE && track() == null; }
+    public Track track() { return needsTrack() ? Store.byUri(trackUri) : null; }
+
+    /** Gone from the library, or the file itself could not be opened last time we looked. */
+    public boolean missing() {
+        return needsTrack() && (track() == null || Store.MISSING.contains(trackUri));
+    }
 
     public boolean timed() { return times < 0; }
 
     public String title() {
         if (type == SILENCE) return "Silence";
+        if (type == BELL) return "Bell";
         Track t = track();
         if (t != null) return t.shortTitle();
         return (trackName == null || trackName.length() == 0) ? "Missing track" : trackName;
@@ -445,6 +473,16 @@ public class Step {
         StringBuilder sb = new StringBuilder();
         if (type == SILENCE) {
             sb.append("rest for ").append(Fmt.rough(durMs));
+            return sb.toString();
+        }
+        if (type == BELL) {
+            sb.append(Bell.toneName(tone)).append(" tone");
+            int n = Math.max(1, times);
+            if (n > 1) {
+                sb.append("  .  ").append(n).append(" rings");
+                if (gapMs > 0) sb.append(" every ").append(Fmt.rough(gapMs));
+            }
+            if (volumePct != 100) sb.append("  .  vol ").append(volumePct).append("%");
             return sb.toString();
         }
         if (type == SECTION) sb.append(Fmt.ms(a)).append(" - ").append(b < 0 ? "end" : Fmt.ms(b));
@@ -472,6 +510,10 @@ public class Step {
     public long estMs() {
         if (!enabled) return 0;
         if (type == SILENCE) return durMs;
+        if (type == BELL) {
+            int n = Math.max(1, times);
+            return Bell.lengthMs(tone) * n + gapMs * Math.max(0, n - 1);
+        }
         if (timed()) return durMs;
         long one = lengthMs();
         if (speedPct > 0 && speedPct != 100) one = one * 100L / speedPct;
@@ -483,7 +525,7 @@ public class Step {
         Step s = new Step();
         s.type = type; s.trackUri = trackUri; s.trackName = trackName;
         s.a = a; s.b = b; s.times = times; s.durMs = durMs; s.gapMs = gapMs;
-        s.speedPct = speedPct; s.volumePct = volumePct; s.enabled = enabled;
+        s.speedPct = speedPct; s.volumePct = volumePct; s.tone = tone; s.enabled = enabled;
         return s;
     }
 
@@ -499,6 +541,7 @@ public class Step {
         o.put("g", gapMs);
         o.put("sp", speedPct);
         o.put("vo", volumePct);
+        o.put("to", tone);
         o.put("en", enabled);
         return o;
     }
@@ -515,6 +558,7 @@ public class Step {
         s.gapMs = o.optLong("g", 0);
         s.speedPct = o.optInt("sp", 100);
         s.volumePct = o.optInt("vo", 100);
+        s.tone = o.optInt("to", Bell.WARM);
         s.enabled = o.optBoolean("en", true);
         return s;
     }
@@ -651,6 +695,8 @@ public class Prefs {
     public int     autoStopMin()   { return sp.getInt("autostop", 0); }     // 0 = off
     public float   speed()         { return speedPct() / 100f; }
     public boolean seeded()        { return sp.getBoolean("seeded2", false); }
+    public boolean notifNagged()   { return sp.getBoolean("notifnag", false); }
+    public void    notifNagged(boolean v) { sp.edit().putBoolean("notifnag", v).apply(); }
 
     public void dark(boolean v)         { sp.edit().putBoolean("dark", v).apply(); }
     public void keepScreenOn(boolean v) { sp.edit().putBoolean("keepOn", v).apply(); }
@@ -684,7 +730,9 @@ import org.json.JSONObject;
 
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /** Persistent state: the track library and the saved programs. */
@@ -693,6 +741,14 @@ public final class Store {
     /** Shared by every screen and by the playback engine (one process). */
     public static final CopyOnWriteArrayList<Track> LIB = new CopyOnWriteArrayList<Track>();
     public static final CopyOnWriteArrayList<Program> PROGRAMS = new CopyOnWriteArrayList<Program>();
+
+    /**
+     * Uris that were in the library but could not be opened. A file can vanish
+     * without leaving the library: deleted, on a card that was pulled, or the
+     * permission grant was revoked. Filled in by the pre-play check and by the
+     * engine, and used to mark steps as missing.
+     */
+    public static final Set<String> MISSING = Collections.synchronizedSet(new HashSet<String>());
 
     private static boolean loaded = false;
 
@@ -734,6 +790,29 @@ public final class Store {
     public static int indexOf(String uri) {
         for (int i = 0; i < LIB.size(); i++) if (LIB.get(i).uri.equals(uri)) return i;
         return -1;
+    }
+
+    /**
+     * Can this file still be opened right now? Cheap enough to run over a
+     * program's steps before playing it. Remembers the answer in MISSING so the
+     * lists can mark the step without doing io on every redraw.
+     */
+    public static boolean readable(Context c, String uri) {
+        Track t = byUri(uri);
+        if (t == null) return false;
+        java.io.InputStream in = null;
+        try {
+            in = c.getContentResolver().openInputStream(t.toUri());
+            boolean ok = in != null;
+            if (ok) MISSING.remove(uri);
+            else MISSING.add(uri);
+            return ok;
+        } catch (Exception e) {
+            MISSING.add(uri);
+            return false;
+        } finally {
+            if (in != null) try { in.close(); } catch (Exception e) { /* ignore */ }
+        }
     }
 
     public static void saveLib(Context c) {
@@ -1217,25 +1296,55 @@ public final class Ui {
         return r;
     }
 
+    public static View sliderRow(Context c, String label, int min, int max, int value,
+                                 String unit, OnSlide cb) {
+        return sliderRow(c, label, min, max, value, unit, Integer.MIN_VALUE, cb);
+    }
+
+    /**
+     * A labelled slider. Pass a normal value and it grows an inline reset
+     * button, shown whenever the slider is not sitting on that value.
+     */
     public static View sliderRow(Context c, String label, final int min, int max, int value,
-                                 final String unit, final OnSlide cb) {
+                                 final String unit, final int normal, final OnSlide cb) {
         LinearLayout box = col(c);
         margin(c, box, 0, 6, 0, 2);
+
         LinearLayout head = row(c);
         TextView t = tv(c, label, 14, TXT, false);
         t.setLayoutParams(lpw(0, WRAP, 1f));
         head.addView(t);
         final TextView val = mono(c, value + unit, 12, ACC);
         head.addView(val);
+
+        final SeekBar s = new SeekBar(c);
+        final ImageView reset = iconBtn(c, Ico.RESET, DIM, 15, 6, "Reset " + label, null);
+        final boolean hasNormal = normal != Integer.MIN_VALUE;
+        if (hasNormal) {
+            reset.setVisibility(value == normal ? View.INVISIBLE : View.VISIBLE);
+            reset.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    buzz(v);
+                    s.setProgress(normal - min);
+                    val.setText(normal + unit);
+                    reset.setVisibility(View.INVISIBLE);
+                    cb.set(normal);
+                }
+            });
+            head.addView(reset);
+        }
         box.addView(head);
-        SeekBar s = new SeekBar(c);
+
         s.setMax(max - min);
         s.setProgress(Math.max(0, value - min));
         s.setProgressTintList(ColorStateList.valueOf(ACC));
         s.setThumbTintList(ColorStateList.valueOf(ACC));
         s.setLayoutParams(lp(MATCH, WRAP));
         s.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            public void onProgressChanged(SeekBar b, int p, boolean fromUser) { val.setText((min + p) + unit); }
+            public void onProgressChanged(SeekBar b, int p, boolean fromUser) {
+                val.setText((min + p) + unit);
+                if (hasNormal) reset.setVisibility((min + p) == normal ? View.INVISIBLE : View.VISIBLE);
+            }
             public void onStartTrackingTouch(SeekBar b) { }
             public void onStopTrackingTouch(SeekBar b) { cb.set(min + b.getProgress()); }
         });
@@ -1346,7 +1455,8 @@ public class Ico extends Drawable {
             FOLDER = 7, TRASH = 8, SAVE = 9, OPEN = 10, HELP = 11, GEAR = 12, LOOP = 13,
             NOTE = 14, AB = 15, CHECK = 16, CLOSE = 17, UP = 18, DOWN = 19, CLOCK = 20,
             LIST = 21, WAVE = 22, EDIT = 23, SCISSOR = 24, MORE = 25, BACK = 26, RIGHT = 27,
-            SEARCH = 28, COPY = 29, MINUS = 30, DRAG = 31, PROGRAM = 32, MOON = 33;
+            SEARCH = 28, COPY = 29, MINUS = 30, DRAG = 31, PROGRAM = 32, MOON = 33,
+            RESET = 34, BELL = 35;
 
     private final int id;
     private int color;
@@ -1547,6 +1657,25 @@ public class Ico extends Drawable {
                 box(cv, ox, oy, u, 8f, 8f, 20f, 20f, 2.4f);
                 poly(cv, ox, oy, u, false, 16f, 5f, 4.5f, 5f, 4.5f, 16f);
                 break;
+            case RESET:
+                r.set(ox + 4.5f * u, oy + 4.5f * u, ox + 19.5f * u, oy + 19.5f * u);
+                cv.drawArc(r, -60f, 300f, false, p);
+                p.setStyle(Paint.Style.FILL);
+                poly(cv, ox, oy, u, true, 11.2f, 2.8f, 6.0f, 3.4f, 8.8f, 8.2f);
+                break;
+            case BELL:
+                path.reset();
+                path.moveTo(ox + 6.2f * u, oy + 16.8f * u);
+                path.cubicTo(ox + 6.2f * u, oy + 10.4f * u, ox + 8.2f * u, oy + 7.6f * u,
+                             ox + 12f * u, oy + 7.6f * u);
+                path.cubicTo(ox + 15.8f * u, oy + 7.6f * u, ox + 17.8f * u, oy + 10.4f * u,
+                             ox + 17.8f * u, oy + 16.8f * u);
+                cv.drawPath(path, p);
+                line(cv, ox, oy, u, 4.6f, 16.8f, 19.4f, 16.8f);
+                line(cv, ox, oy, u, 12f, 4.8f, 12f, 7.6f);
+                p.setStyle(Paint.Style.FILL);
+                cv.drawCircle(ox + 12f * u, oy + 19.8f * u, 1.8f * u, p);
+                break;
             case MOON:
                 path.reset();
                 path.moveTo(ox + 19f * u, oy + 15.5f * u);
@@ -1595,93 +1724,221 @@ public class Ico extends Drawable {
 '@
 
 # ---------------------------------------------------------------------------
+# Java: the synthesised bell
+# ---------------------------------------------------------------------------
+Write-Src "$PKG_PATH\Bell.java" @'
+package com.riola.player;
+
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
+import android.media.AudioTrack;
+import android.os.Handler;
+import android.os.Looper;
+
+/**
+ * A soft struck bell, synthesised at runtime so the apk carries no audio files.
+ *
+ * The gentleness comes from the envelope, not the volume: the bright partials
+ * die away in well under a second while the low ones ring on for seconds, and
+ * the attack is ramped over 8 ms so there is no click. That is roughly what a
+ * singing bowl does, and it is why this does not sound like a beep.
+ */
+public class Bell {
+
+    public static final int LOW = 0, WARM = 1, BRIGHT = 2;
+
+    private static final int RATE = 22050;
+    private static final float[] F0    = { 174.6f, 261.6f, 392.0f };   // F3, C4, G4
+    private static final long[]  LEN   = { 6000, 5000, 4000 };
+    private static final String[] NAMES = { "low", "warm", "bright" };
+
+    private static final short[][] CACHE = new short[3][];
+
+    private AudioTrack track;
+
+    public static int clamp(int tone) { return tone < 0 ? 0 : (tone > 2 ? 2 : tone); }
+    public static long lengthMs(int tone) { return LEN[clamp(tone)]; }
+    public static String toneName(int tone) { return NAMES[clamp(tone)]; }
+
+    /** Build the samples ahead of time so the first ring is not late. */
+    public static void warm() {
+        new Thread(new Runnable() {
+            public void run() {
+                try { pcm(WARM); } catch (Throwable t) { /* not important */ }
+            }
+        }, "riola-bell-warm").start();
+    }
+
+    private static synchronized short[] pcm(int tone) {
+        tone = clamp(tone);
+        if (CACHE[tone] != null) return CACHE[tone];
+
+        int n = (int) (RATE * LEN[tone] / 1000L);
+        short[] out = new short[n];
+        float f0 = F0[tone];
+
+        // partial: ratio to the fundamental, starting level, seconds to decay
+        float[] ratio = { 0.5f,  1.0f,  2.0f,  2.97f, 4.06f, 5.43f };
+        float[] amp   = { 0.32f, 1.00f, 0.40f, 0.18f, 0.09f, 0.05f };
+        float[] decay = { 6.5f,  4.5f,  2.4f,  1.3f,  0.8f,  0.45f };
+
+        double w = 2.0 * Math.PI / RATE;
+        float attack = 0.008f;   // seconds
+        float tail = 0.35f;      // fade the very end so the buffer cannot click
+        float scale = 11000f;
+
+        for (int i = 0; i < n; i++) {
+            float t = i / (float) RATE;
+            float s = 0f;
+            for (int k = 0; k < ratio.length; k++) {
+                s += amp[k] * (float) Math.exp(-t / decay[k]) * (float) Math.sin(w * f0 * ratio[k] * i);
+            }
+            // a second prime a hair sharp gives the tone a slow, warm shimmer
+            s += 0.22f * (float) Math.exp(-t / 4.0f) * (float) Math.sin(w * f0 * 1.003f * i);
+
+            if (t < attack) s *= 0.5f - 0.5f * (float) Math.cos(Math.PI * t / attack);
+            float left = (n - i) / (float) RATE;
+            if (left < tail) s *= left / tail;
+
+            int v = (int) (s * scale);
+            if (v > 32000) v = 32000;
+            if (v < -32000) v = -32000;
+            out[i] = (short) v;
+        }
+        CACHE[tone] = out;
+        return out;
+    }
+
+    /** Strike it. Returns straight away; the tone rings on by itself. */
+    public void ring(int tone, float volume) {
+        stop();
+        try {
+            short[] data = pcm(tone);
+            AudioTrack t = new AudioTrack.Builder()
+                    .setAudioAttributes(new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .build())
+                    .setAudioFormat(new AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(RATE)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .build())
+                    .setBufferSizeInBytes(data.length * 2)
+                    .setTransferMode(AudioTrack.MODE_STATIC)
+                    .build();
+            t.write(data, 0, data.length);
+            float v = volume < 0f ? 0f : (volume > 1f ? 1f : volume);
+            t.setVolume(v);
+            t.play();
+            track = t;
+        } catch (Throwable e) {
+            track = null;
+        }
+    }
+
+    public void stop() {
+        AudioTrack t = track;
+        track = null;
+        if (t == null) return;
+        try { t.setVolume(0f); } catch (Exception e) { /* ignore */ }
+        try { t.pause(); } catch (Exception e) { /* ignore */ }
+        try { t.flush(); } catch (Exception e) { /* ignore */ }
+        try { t.stop(); } catch (Exception e) { /* ignore */ }
+        try { t.release(); } catch (Exception e) { /* ignore */ }
+    }
+
+    /** One strike that cleans up after itself, for the editor preview. */
+    public static void preview(int tone, float volume) {
+        final Bell b = new Bell();
+        b.ring(tone, volume);
+        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+            public void run() { b.stop(); }
+        }, lengthMs(tone) + 250);
+    }
+}
+'@
+
+
+# ---------------------------------------------------------------------------
 # Java: in-app guide
 # ---------------------------------------------------------------------------
 Write-Src "$PKG_PATH\HelpText.java" @'
 package com.riola.player;
 
-/** The in-app guide. Plain ASCII, shown in a scrolling dialog. */
+/** The in-app guide, as heading and body pairs so it can be laid out properly. */
 public final class HelpText {
 
     private HelpText() { }
 
-    public static final String TEXT =
-        "HOW RIOLA WORKS\n" +
-        "===============\n" +
-        "\n" +
-        "A program is a list of steps that Riola plays from top to\n" +
-        "bottom. Build one by tapping Add step; there is nothing to\n" +
-        "type and nothing to memorise.\n" +
-        "\n" +
-        "1. TRACKS\n" +
-        "---------\n" +
-        "Open Tracks and add files, or point Riola at a whole folder.\n" +
-        "Riola only reads them - your files are never moved, copied or\n" +
-        "changed. Tap a track to hear it. The little AB button opens\n" +
-        "the section picker.\n" +
-        "\n" +
-        "2. STEPS\n" +
-        "--------\n" +
-        "There are three kinds of step.\n" +
-        "\n" +
-        "  Whole track   plays a track from start to finish.\n" +
-        "  Section       plays one slice of a track, from A to B.\n" +
-        "  Silence       plays nothing for a while.\n" +
-        "\n" +
-        "Every playing step repeats in one of two ways:\n" +
-        "\n" +
-        "  a number of times  -  play it 8 times, then move on.\n" +
-        "  for a length       -  keep looping it for 12 minutes.\n" +
-        "\n" +
-        "Each step can also have:\n" +
-        "\n" +
-        "  Gap      a rest between one repeat and the next.\n" +
-        "  Speed    slower or faster, without changing the pitch.\n" +
-        "  Volume   quieter or louder than the other steps.\n" +
-        "  Off      keep the step but skip it for now.\n" +
-        "\n" +
-        "3. SECTIONS BY EAR\n" +
-        "------------------\n" +
-        "In a section step, tap Pick by ear. Play the track, tap Set A\n" +
-        "where the slice should start and Set B where it should end.\n" +
-        "The 1s and 5s buttons nudge each mark. Turn on Loop A-B to\n" +
-        "hear the slice on repeat while you fine tune it.\n" +
-        "\n" +
-        "4. RUNNING\n" +
-        "----------\n" +
-        "Press the play button next to a program on the home screen,\n" +
-        "or Run inside the editor. While a program runs you can:\n" +
-        "\n" +
-        "  - pause and resume\n" +
-        "  - jump to the previous or next step\n" +
-        "  - tap any step in the list to jump straight to it\n" +
-        "  - drag the progress bar to move inside the current track\n" +
-        "\n" +
-        "Playback continues when you leave the app or lock the phone.\n" +
-        "The notification and the lock screen carry the same controls.\n" +
-        "\n" +
-        "5. REPEATING THE WHOLE PROGRAM\n" +
-        "------------------------------\n" +
-        "In the editor, Repeat program says how many times the whole\n" +
-        "list runs. Set it to forever for an endless session.\n" +
-        "\n" +
-        "6. SETTINGS WORTH KNOWING\n" +
-        "-------------------------\n" +
-        "  Count in        a few seconds of silence before step one,\n" +
-        "                  handy if you need to pick up an instrument.\n" +
-        "  Stop after      a sleep timer: end everything after N minutes.\n" +
-        "  Fade at edges   softens the jump when a loop restarts.\n" +
-        "  Keep awake      holds the CPU on so long silences stay exact.\n" +
-        "  Pause for calls and for unplugged headphones are on by default.\n" +
-        "\n" +
-        "GOOD TO KNOW\n" +
-        "------------\n" +
-        "  - Steps remember the track itself, so reordering or renaming\n" +
-        "    tracks never breaks a program.\n" +
-        "  - Remove a track that a program uses and the step is marked\n" +
-        "    missing; it is skipped instead of stopping the run.\n" +
-        "  - Everything is stored on the phone. Riola has no network\n" +
-        "    permission at all.\n";
+    public static final String[][] SECTIONS = {
+        { "The idea",
+          "A program is a list of steps that Riola plays from top to bottom. You build it by "
+        + "tapping, so there is nothing to type and no syntax to remember." },
+
+        { "1. Add your tracks",
+          "Open Tracks and add files, or point Riola at a whole folder. Riola only reads them: "
+        + "your files are never moved, copied or changed. Tap a track to hear it." },
+
+        { "2. Build the steps",
+          "There are four kinds of step.\n\n"
+        + "Whole track plays a track from start to finish.\n"
+        + "Section plays one slice of a track, from A to B.\n"
+        + "Silence plays nothing for a while.\n"
+        + "Bell rings a soft chime to mark a change." },
+
+        { "3. Say how often",
+          "Every playing step repeats in one of two ways: a number of times, or for a length of "
+        + "time. Play the phrase eight times, or keep looping it for twelve minutes." },
+
+        { "Fine tuning a step",
+          "Gap adds a rest between one repeat and the next.\n"
+        + "Speed plays it slower or faster without changing the pitch.\n"
+        + "Volume makes one step quieter than the rest.\n"
+        + "Turning a step off keeps it in the list but skips it for now." },
+
+        { "Marking a section by ear",
+          "In a section step, tap Pick by ear. Play the track, tap Set A where the slice should "
+        + "start and Set B where it should end. The 1s and 5s buttons nudge each mark, and Loop "
+        + "A-B plays the slice on repeat while you fine tune it." },
+
+        { "The bell",
+          "Put a bell between two silences and you have a session you can follow with your eyes "
+        + "closed: sit for five minutes, hear the chime, change your breathing, sit for five "
+        + "more.\n\n"
+        + "There are three voices, and it can ring more than once with a gap you choose. Tap "
+        + "Hear it while you set it up. The tone fades in softly and rings out slowly, so it "
+        + "marks the moment without jolting you." },
+
+        { "Running a program",
+          "Press play next to a program on the home screen, or Run inside the editor. While it "
+        + "runs you can pause, jump to the previous or next step, tap any step to go straight to "
+        + "it, and drag the progress bar to move inside the current track.\n\n"
+        + "Playback keeps going when you leave the app or lock the phone. The notification and "
+        + "the lock screen carry the same controls." },
+
+        { "Repeating everything",
+          "In the editor, Repeat program says how many times the whole list runs. Set it to "
+        + "forever for an endless session." },
+
+        { "Settings worth knowing",
+          "Count in gives you a few seconds of silence before step one, handy if you need to "
+        + "pick up an instrument.\n"
+        + "Stop after is a sleep timer that ends everything after a set number of minutes.\n"
+        + "Fade at edges softens the jump when a loop restarts.\n"
+        + "Keep the CPU awake holds the processor on so long silences stay exact.\n"
+        + "Pausing for calls and for unplugged headphones is on by default." },
+
+        { "If a track goes missing",
+          "Steps remember the track itself, so reordering or renaming tracks never breaks a "
+        + "program. If a file is deleted or its storage is unavailable, Riola tells you which "
+        + "steps are affected before it starts playing, and those steps are skipped rather than "
+        + "stopping the session." },
+
+        { "Privacy",
+          "Everything stays on the phone. Riola has no network permission at all, no accounts "
+        + "and no analytics." }
+    };
 }
 '@
 
@@ -1717,6 +1974,7 @@ public class Engine {
         public String programId = "", programName = "";
         public int  step, steps;
         public String stepTitle = "", stepDetail = "";
+        public String trackUri = "";     // what is loaded right now, "" for silence and bells
         public int  posMs, durMs;
         public long stepRemainMs = -1;   // -1 = not time limited
         public long progRemainMs = -1;
@@ -1725,6 +1983,7 @@ public class Engine {
         public int  loopDone;
         public int  loopTotal = 1;       // -1 = forever
         public int  countIn = -1;        // seconds left before the first step
+        public int  skipped;             // steps passed over because the track was gone
     }
 
     public interface Listener {
@@ -1750,6 +2009,7 @@ public class Engine {
     public final St st = new St();
 
     private MediaPlayer mp;
+    private final Bell bell = new Bell();
     private String loadedUri = "";
     private Thread worker;
     private final List<Step> steps = new ArrayList<Step>();
@@ -1837,6 +2097,7 @@ public class Engine {
         st.loopDone = 0;
         st.loopTotal = loops;
         st.countIn = -1;
+        st.skipped = 0;
         int stopMin = st.preview ? 0 : prefs.autoStopMin();
         deadline = stopMin > 0 ? SystemClock.elapsedRealtime() + stopMin * 60000L : -1;
         final int myGen = ++gen;
@@ -1856,6 +2117,7 @@ public class Engine {
         }
         worker = null;
         running = false;
+        bell.stop();
         releasePlayer();
         st.running = false;
         st.paused = false;
@@ -1931,7 +2193,11 @@ public class Engine {
             st.steps = steps.size();
             st.stepTitle = s.title();
             st.stepDetail = s.detail();
+            st.trackUri = s.needsTrack() ? s.trackUri : "";
             st.repDone = 0;
+            // clear the previous step's clock so the bar cannot flash its numbers
+            st.posMs = 0;
+            st.durMs = 0;
             st.repTotal = s.timed() ? -1 : Math.max(1, s.times);
             st.stepRemainMs = s.timed() ? s.durMs : -1;
             st.resting = s.type == Step.SILENCE;
@@ -1944,6 +2210,9 @@ public class Engine {
             if (s.type == Step.SILENCE) {
                 pausePlayer();
                 silence(s.durMs, rest, true);
+            } else if (s.type == Step.BELL) {
+                pausePlayer();
+                bellStep(s, rest);
             } else {
                 segment(s, rest);
             }
@@ -1958,6 +2227,7 @@ public class Engine {
 
         boolean finished = !stopReq;
         pausePlayer();
+        bell.stop();
         releasePlayer();
         running = false;
         st.running = false;
@@ -2031,15 +2301,68 @@ public class Engine {
         }
     }
 
+    /** A gentle marker: one or more strikes, with an optional gap between them. */
+    private void bellStep(Step step, long rest) {
+        int strikes = Math.max(1, step.times);
+        long len = Bell.lengthMs(step.tone);
+        st.repTotal = strikes;
+        st.durMs = (int) len;
+
+        for (int i = 0; i < strikes; i++) {
+            if (stopReq || skip != 0 || expired()) { bell.stop(); return; }
+            st.repDone = i;
+            bell.ring(step.tone, vol * stepVol * duck);
+
+            long remain = len;
+            long last = SystemClock.elapsedRealtime();
+            while (remain > 0) {
+                if (stopReq || skip != 0 || expired()) { bell.stop(); return; }
+                waitLock(100);
+                long now = SystemClock.elapsedRealtime();
+                long d = now - last;
+                last = now;
+                if (paused) {
+                    // let it fall silent, then strike again when we resume
+                    bell.stop();
+                    while (paused && !stopReq && skip == 0) waitLock(150);
+                    if (stopReq || skip != 0) return;
+                    bell.ring(step.tone, vol * stepVol * duck);
+                    remain = len;
+                    last = SystemClock.elapsedRealtime();
+                    continue;
+                }
+                remain -= d;
+                st.posMs = (int) Math.max(0, len - remain);
+                st.stepRemainMs = Math.max(0, remain) + (long) (strikes - 1 - i) * (len + step.gapMs);
+                st.progRemainMs = rest + st.stepRemainMs;
+                push();
+            }
+            if (i < strikes - 1 && step.gapMs > 0) {
+                st.resting = true;
+                push();
+                silence(step.gapMs, rest, false);
+                st.resting = false;
+                if (stopReq || skip != 0) return;
+            }
+        }
+        st.repDone = strikes;
+    }
+
     /** A whole track or an A-B slice, repeated a number of times or for a while. */
     private void segment(Step step, long rest) {
         Track track = step.track();
         if (track == null) {
+            st.skipped++;
             log("  ! that track is not in the library any more - skipped");
             waitLock(400);
             return;
         }
-        if (!open(track)) return;
+        if (!open(track)) {
+            st.skipped++;
+            Store.MISSING.add(track.uri);
+            return;
+        }
+        Store.MISSING.remove(track.uri);
 
         long dur = duration();
         boolean known = dur > 0;
@@ -2763,6 +3086,156 @@ public class PlayerBar implements Engine.Listener {
 }
 '@
 
+Write-Src "$PKG_PATH\Runner.java" @'
+package com.riola.player;
+
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.NotificationManager;
+import android.content.Context;
+import android.content.DialogInterface;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.Settings;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Starts a program. Before any sound comes out it checks that every track the
+ * program needs can still be opened, so a file that vanished is reported now
+ * rather than silently skipped twenty minutes into a session.
+ */
+public final class Runner {
+
+    public interface OnStarted { void started(); }
+
+    private Runner() { }
+
+    public static void play(final Activity a, final Program p, final int from, final OnStarted cb) {
+        if (p == null) return;
+        if (p.enabledCount() == 0) {
+            Ui.toast(a, "Add a step first");
+            return;
+        }
+        new Thread(new Runnable() {
+            public void run() {
+                final List<String> bad = new ArrayList<String>();
+                int playable = 0;
+                for (int i = 0; i < p.steps.size(); i++) {
+                    Step s = p.steps.get(i);
+                    if (!s.enabled) continue;
+                    if (!s.needsTrack()) { playable++; continue; }
+                    if (s.track() == null || !Store.readable(a, s.trackUri)) {
+                        String name = s.trackName == null || s.trackName.length() == 0
+                                ? "unknown track" : s.trackName;
+                        bad.add("Step " + (i + 1) + "  -  " + name);
+                    } else {
+                        playable++;
+                    }
+                }
+                final int ok = playable;
+                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    public void run() {
+                        if (a.isFinishing() || a.isDestroyed()) return;
+                        if (bad.isEmpty()) go(a, p, from, cb);
+                        else warn(a, p, from, bad, ok, cb);
+                    }
+                });
+            }
+        }, "riola-precheck").start();
+    }
+
+    private static void warn(final Activity a, final Program p, final int from,
+                             List<String> bad, int playable, final OnStarted cb) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(playable == 0
+                ? "Nothing in this program can play right now:\n\n"
+                : "These steps cannot play, so they will be skipped:\n\n");
+        for (int i = 0; i < bad.size() && i < 6; i++) sb.append("    ").append(bad.get(i)).append('\n');
+        if (bad.size() > 6) sb.append("    ...and ").append(bad.size() - 6).append(" more\n");
+        sb.append("\nThe file may have been deleted or moved, or it lives on storage that is not available. "
+                + "Open the program and point those steps at a file again.");
+
+        AlertDialog.Builder b = Ui.dialog(a)
+                .setTitle(bad.size() == 1 ? "1 step cannot play" : (bad.size() + " steps cannot play"))
+                .setMessage(sb.toString())
+                .setNegativeButton("Cancel", null);
+
+        if (!(a instanceof EditorActivity)) {
+            b.setNeutralButton("Open program", new DialogInterface.OnClickListener() {
+                public void onClick(DialogInterface d, int w) {
+                    a.startActivity(new Intent(a, EditorActivity.class).putExtra("id", p.id));
+                }
+            });
+        }
+        if (playable > 0) {
+            b.setPositiveButton("Play anyway", new DialogInterface.OnClickListener() {
+                public void onClick(DialogInterface d, int w) { go(a, p, from, cb); }
+            });
+        }
+        b.show();
+    }
+
+    private static void go(Activity a, Program p, int from, OnStarted cb) {
+        askNotificationPermission(a);
+        p.lastRun = System.currentTimeMillis();
+        Store.savePrograms(a);
+        Engine.get(a).start(p, from);
+        PlayerBar.startService(a);
+        if (cb != null) cb.started();
+        explainSilentNotifications(a);
+    }
+
+    /**
+     * On some phones the runtime prompt never appears, because notifications
+     * are already switched off for the app - several skins do that to
+     * sideloaded apps. Playback still works, but there would be no
+     * notification and no lock screen controls and no hint as to why, so say
+     * it once and offer the settings page.
+     */
+    private static void explainSilentNotifications(final Activity a) {
+        final Prefs prefs = new Prefs(a);
+        if (prefs.notifNagged()) return;
+        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+            public void run() {
+                if (a.isFinishing() || a.isDestroyed()) return;
+                NotificationManager nm = (NotificationManager) a.getSystemService(Context.NOTIFICATION_SERVICE);
+                if (nm == null || nm.areNotificationsEnabled()) return;
+                prefs.notifNagged(true);
+                Ui.dialog(a)
+                        .setTitle("No playback controls")
+                        .setMessage("Notifications are switched off for Riola, so while a program runs "
+                                + "there is no notification and no lock screen controls. The program "
+                                + "itself plays normally. You can switch them on in Android settings.")
+                        .setNegativeButton("Not now", null)
+                        .setPositiveButton("Open settings", new DialogInterface.OnClickListener() {
+                            public void onClick(DialogInterface d, int w) {
+                                try {
+                                    a.startActivity(new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                                            .putExtra(Settings.EXTRA_APP_PACKAGE, a.getPackageName()));
+                                } catch (Exception e) {
+                                    Ui.toast(a, "Could not open notification settings");
+                                }
+                            }
+                        }).show();
+            }
+        }, 4000);
+    }
+
+    public static void askNotificationPermission(Activity a) {
+        if (Build.VERSION.SDK_INT >= 33
+                && a.checkSelfPermission("android.permission.POST_NOTIFICATIONS")
+                   != PackageManager.PERMISSION_GRANTED) {
+            a.requestPermissions(new String[]{ "android.permission.POST_NOTIFICATIONS" }, 103);
+        }
+    }
+}
+'@
+
 Write-Src "$PKG_PATH\Pickers.java" @'
 package com.riola.player;
 
@@ -2878,9 +3351,33 @@ public final class Pickers {
     public static void duration(final Activity a, String title, long ms, final OnMs cb) {
         final long[] value = { Math.max(0, ms) };
 
-        LinearLayout box = Ui.col(a);
+        final LinearLayout box = Ui.col(a);
         int p = Ui.dp(a, 18);
         box.setPadding(p, Ui.dp(a, 8), p, 0);
+
+        final Runnable[] render = new Runnable[1];
+        render[0] = new Runnable() {
+            public void run() { fillDuration(a, box, value, render[0]); }
+        };
+        render[0].run();
+
+        ScrollView sv = new ScrollView(a);
+        sv.addView(box, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
+
+        Ui.dialog(a).setTitle(title).setView(sv)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Set", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) { cb.picked(value[0]); }
+                }).show();
+    }
+
+    /**
+     * Rebuilt whenever a preset is tapped. The steppers keep their own internal
+     * counter, so redrawing is the only way to stop them showing a stale number.
+     */
+    private static void fillDuration(final Activity a, final LinearLayout box,
+                                     final long[] value, final Runnable again) {
+        box.removeAllViews();
 
         final TextView shown = Ui.tv(a, Fmt.ms(value[0]), 30, Ui.ACC, true);
         shown.setGravity(Gravity.CENTER);
@@ -2891,10 +3388,11 @@ public final class Pickers {
         final int[] presets = { 15, 30, 60, 120, 300, 600, 1200 };
         for (int i = 0; i < presets.length; i++) {
             final int secs = presets[i];
-            quick.addView(Ui.chip(a, secs < 60 ? (secs + "s") : ((secs / 60) + "m"), false, new View.OnClickListener() {
+            quick.addView(Ui.chip(a, secs < 60 ? (secs + "s") : ((secs / 60) + "m"),
+                    value[0] == secs * 1000L, new View.OnClickListener() {
                 public void onClick(View v) {
                     value[0] = secs * 1000L;
-                    shown.setText(Fmt.ms(value[0]));
+                    again.run();
                 }
             }));
         }
@@ -2904,25 +3402,21 @@ public final class Pickers {
         Ui.margin(a, row, 0, 8, 0, 4);
         box.addView(row);
 
-        box.addView(labelled(a, "Minutes", Ui.stepper(a, (int) (value[0] / 60000L), 0, 600, 1, "", new Ui.OnValue() {
+        box.addView(labelled(a, "Minutes", Ui.stepper(a, (int) (value[0] / 60000L), 0, 600, 1, "",
+                new Ui.OnValue() {
             public void set(int v) {
                 value[0] = v * 60000L + (value[0] % 60000L);
                 shown.setText(Fmt.ms(value[0]));
             }
         })));
-        box.addView(labelled(a, "Seconds", Ui.stepper(a, (int) ((value[0] % 60000L) / 1000L), 0, 55, 5, "", new Ui.OnValue() {
+        box.addView(labelled(a, "Seconds", Ui.stepper(a, (int) ((value[0] % 60000L) / 1000L), 0, 55, 5, "",
+                new Ui.OnValue() {
             public void set(int v) {
                 value[0] = (value[0] / 60000L) * 60000L + v * 1000L;
                 shown.setText(Fmt.ms(value[0]));
             }
         })));
         box.addView(Ui.gap(a, 6));
-
-        Ui.dialog(a).setTitle(title).setView(box)
-                .setNegativeButton("Cancel", null)
-                .setPositiveButton("Set", new DialogInterface.OnClickListener() {
-                    public void onClick(DialogInterface d, int w) { cb.picked(value[0]); }
-                }).show();
     }
 
     // ---- position inside a track ----------------------------------------
@@ -3049,6 +3543,7 @@ public class MainActivity extends Activity implements PlayerBar.Host {
         super.onCreate(saved);
         Store.load(this);
         eng = Engine.get(this);
+        Bell.warm();
         setContentView(build());
         Ui.applyWindow(this);
     }
@@ -3299,20 +3794,13 @@ public class MainActivity extends Activity implements PlayerBar.Host {
             open(p);
             return;
         }
-        askNotificationPermission();
-        p.lastRun = System.currentTimeMillis();
-        Store.savePrograms(this);
-        eng.start(p, from);
-        PlayerBar.startService(this);
-        liveProgramId = "";
-        buildLive();
-    }
-
-    private void askNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= 33
-                && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{ "android.permission.POST_NOTIFICATIONS" }, REQ_NOTIF);
-        }
+        Runner.play(this, p, from, new Runner.OnStarted() {
+            public void started() {
+                liveProgramId = "";
+                buildLive();
+                refresh();
+            }
+        });
     }
 
     // ======================================================================
@@ -3365,6 +3853,7 @@ public class MainActivity extends Activity implements PlayerBar.Host {
 
     static int stepIcon(Step s) {
         if (s.type == Step.SILENCE) return Ico.CLOCK;
+        if (s.type == Step.BELL) return Ico.BELL;
         if (s.type == Step.SECTION) return Ico.AB;
         return Ico.NOTE;
     }
@@ -3390,20 +3879,37 @@ public class MainActivity extends Activity implements PlayerBar.Host {
     }
 
     public void onEngineFinished(boolean completed) {
+        int skipped = eng.st.skipped;
         refresh();
-        Ui.toast(this, completed ? "Program finished" : "Stopped");
+        if (skipped > 0) {
+            Ui.toast(this, (completed ? "Finished, but " : "Stopped. ") + skipped
+                    + (skipped == 1 ? " step was skipped - its track is missing"
+                                    : " steps were skipped - their tracks are missing"));
+        } else {
+            Ui.toast(this, completed ? "Program finished" : "Stopped");
+        }
     }
 
     // ======================================================================
     // dialogs
     // ======================================================================
     private void help() {
+        LinearLayout box = Ui.col(this);
+        int p = Ui.dp(this, 20);
+        box.setPadding(p, Ui.dp(this, 4), p, 0);
+        for (int i = 0; i < HelpText.SECTIONS.length; i++) {
+            String[] section = HelpText.SECTIONS[i];
+            TextView h = Ui.tv(this, section[0], 14, Ui.ACC, true);
+            Ui.margin(this, h, 0, i == 0 ? 0 : 18, 0, 6);
+            box.addView(h);
+            TextView b = Ui.tv(this, section[1], 13.5f, Ui.TXT, false);
+            b.setLineSpacing(Ui.dp(this, 3), 1f);
+            b.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
+            box.addView(b);
+        }
+        box.addView(Ui.gap(this, 12));
         ScrollView sv = new ScrollView(this);
-        TextView t = Ui.mono(this, HelpText.TEXT, 11, Ui.TXT);
-        int p = Ui.dp(this, 16);
-        t.setPadding(p, p, p, p);
-        t.setTextIsSelectable(true);
-        sv.addView(t, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
+        sv.addView(box, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
         Ui.dialog(this).setTitle("How Riola works").setView(sv).setPositiveButton("Close", null).show();
     }
 
@@ -3441,19 +3947,19 @@ public class MainActivity extends Activity implements PlayerBar.Host {
         }));
 
         box.addView(Ui.divider(this));
-        box.addView(Ui.sliderRow(this, "Master volume", 0, 100, prefs.volume(), "%", new Ui.OnSlide() {
+        box.addView(Ui.sliderRow(this, "Master volume", 0, 100, prefs.volume(), "%", 100, new Ui.OnSlide() {
             public void set(int v) { prefs.volume(v); eng.setMasterVolume(v); }
         }));
-        box.addView(Ui.sliderRow(this, "Playback speed", 50, 200, prefs.speedPct(), "%", new Ui.OnSlide() {
+        box.addView(Ui.sliderRow(this, "Playback speed", 50, 200, prefs.speedPct(), "%", 100, new Ui.OnSlide() {
             public void set(int v) { prefs.speedPct(v); eng.setMasterSpeed(v); }
         }));
-        box.addView(Ui.sliderRow(this, "Fade at loop edges", 0, 1000, prefs.fadeMs(), " ms", new Ui.OnSlide() {
+        box.addView(Ui.sliderRow(this, "Fade at loop edges", 0, 1000, prefs.fadeMs(), " ms", 150, new Ui.OnSlide() {
             public void set(int v) { prefs.fadeMs(v); }
         }));
-        box.addView(Ui.sliderRow(this, "Count in before starting", 0, 15, prefs.countIn(), " s", new Ui.OnSlide() {
+        box.addView(Ui.sliderRow(this, "Count in before starting", 0, 15, prefs.countIn(), " s", 0, new Ui.OnSlide() {
             public void set(int v) { prefs.countIn(v); }
         }));
-        box.addView(Ui.sliderRow(this, "Stop everything after", 0, 180, prefs.autoStopMin(), " min", new Ui.OnSlide() {
+        box.addView(Ui.sliderRow(this, "Stop everything after", 0, 180, prefs.autoStopMin(), " min", 0, new Ui.OnSlide() {
             public void set(int v) { prefs.autoStopMin(v); }
         }));
         TextView note = Ui.tv(this, "Set the stop timer to 0 to switch it off.", 11, Ui.DIM, false);
@@ -3508,6 +4014,7 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
     private LinearLayout stepsBox, loopBox;
     private TextView titleView, subView, totalBadge;
     private final List<View> rows = new ArrayList<View>();
+    private boolean dirty;
 
     @Override
     protected void onCreate(Bundle saved) {
@@ -3537,7 +4044,10 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
     protected void onPause() {
         if (prog != null) {
             bar.detach();
-            Store.put(this, prog);
+            // Every edit already saves through save(); writing again here would
+            // bump the program's timestamp just for opening it and reshuffle
+            // the home list.
+            if (dirty) { Store.put(this, prog); dirty = false; }
         }
         super.onPause();
     }
@@ -3710,11 +4220,11 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
     // actions
     // ======================================================================
     private void addStep() {
-        final String[] items = { "Whole track", "Section of a track", "Silence" };
+        final String[] items = { "Whole track", "Section of a track", "Silence", "Bell" };
         Ui.dialog(this).setTitle("Add step").setItems(items, new DialogInterface.OnClickListener() {
             public void onClick(DialogInterface d, int which) {
-                if (which == 2) {
-                    prog.steps.add(Step.silence(60000));
+                if (which == 2 || which == 3) {
+                    prog.steps.add(which == 2 ? Step.silence(60000) : Step.bell());
                     save();
                     refresh();
                     edit(prog.steps.size() - 1);
@@ -3817,15 +4327,16 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
     private void run(int from) {
         if (prog.enabledCount() == 0) { Ui.toast(this, "Add a step first"); return; }
         save();
-        prog.lastRun = System.currentTimeMillis();
-        Store.savePrograms(this);
-        eng.start(prog, from);
-        PlayerBar.startService(this);
-        refresh();
+        Runner.play(this, prog, from, new Runner.OnStarted() {
+            public void started() { refresh(); }
+        });
     }
 
     private void save() {
-        if (prog != null) Store.put(this, prog);
+        if (prog == null) return;
+        dirty = true;
+        Store.put(this, prog);
+        dirty = false;
     }
 
     // ======================================================================
@@ -3881,6 +4392,7 @@ public final class StepSheet {
         render[0].run();
 
         String kind = step.type == Step.SILENCE ? "Silence"
+                : step.type == Step.BELL ? "Bell"
                 : (step.type == Step.SECTION ? "Section" : "Whole track");
 
         Ui.dialog(a).setTitle("Step " + (index + 1) + "  -  " + kind)
@@ -3904,7 +4416,7 @@ public final class StepSheet {
     private static void fill(final Activity a, final LinearLayout box, final Step step, final Runnable again) {
         box.removeAllViews();
 
-        if (step.type != Step.SILENCE) {
+        if (step.needsTrack()) {
             Track bound = step.track();
             String label = bound != null ? bound.shortTitle()
                     : (step.trackName.length() > 0 ? step.trackName + "  (missing)" : "pick a track");
@@ -3991,6 +4503,59 @@ public final class StepSheet {
                     });
                 }
             }));
+
+        } else if (step.type == Step.BELL) {
+            box.addView(Ui.tv(a, "TONE", 11, Ui.DIM, true));
+            box.addView(Ui.gap(a, 6));
+            box.addView(Ui.seg(a, new String[]{ "Low", "Warm", "Bright" }, Bell.clamp(step.tone),
+                    new Ui.OnPick() {
+                public void set(int i) {
+                    step.tone = i;
+                    Bell.preview(i, step.volumePct / 100f);
+                    again.run();
+                }
+            }));
+            TextView hint = Ui.tv(a, "A soft chime to mark a change without opening your eyes.",
+                    11.5f, Ui.DIM, false);
+            Ui.margin(a, hint, 2, 6, 0, 0);
+            box.addView(hint);
+
+            LinearLayout hear = Ui.btn(a, "Hear it", Ico.BELL, Ui.SECONDARY, new View.OnClickListener() {
+                public void onClick(View v) { Bell.preview(step.tone, step.volumePct / 100f); }
+            });
+            hear.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
+            Ui.margin(a, hear, 0, 8, 0, 0);
+            box.addView(hear);
+
+            LinearLayout rings = Ui.row(a);
+            Ui.margin(a, rings, 0, 10, 0, 0);
+            TextView rt = Ui.tv(a, "Ring it", 13.5f, Ui.DIM, false);
+            rt.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+            rings.addView(rt);
+            LinearLayout rs = Ui.stepper(a, Math.max(1, step.times), 1, 9, 1, "x", new Ui.OnValue() {
+                public void set(int v) { step.times = v; }
+            });
+            rs.setLayoutParams(Ui.lp(Ui.dp(a, 150), Ui.WRAP));
+            rings.addView(rs);
+            box.addView(rings);
+
+            LinearLayout bg = Ui.row(a);
+            Ui.margin(a, bg, 0, 8, 0, 0);
+            TextView bt = Ui.tv(a, "Gap between rings", 13.5f, Ui.DIM, false);
+            bt.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+            bg.addView(bt);
+            LinearLayout bs = Ui.stepper(a, (int) (step.gapMs / 1000L), 0, 120, 1, "s", new Ui.OnValue() {
+                public void set(int v) { step.gapMs = v * 1000L; }
+            });
+            bs.setLayoutParams(Ui.lp(Ui.dp(a, 150), Ui.WRAP));
+            bg.addView(bs);
+            box.addView(bg);
+
+            box.addView(Ui.divider(a));
+            box.addView(Ui.sliderRow(a, "Bell volume", 10, 100, step.volumePct, "%", 100, new Ui.OnSlide() {
+                public void set(int v) { step.volumePct = v; }
+            }));
+
         } else {
             box.addView(Ui.gap(a, 10));
             box.addView(Ui.tv(a, "HOW OFTEN", 11, Ui.DIM, true));
@@ -4041,10 +4606,12 @@ public final class StepSheet {
             box.addView(g);
 
             box.addView(Ui.divider(a));
-            box.addView(Ui.sliderRow(a, "Speed for this step", 50, 200, step.speedPct, "%", new Ui.OnSlide() {
+            box.addView(Ui.sliderRow(a, "Speed for this step", 50, 200, step.speedPct, "%", 100,
+                    new Ui.OnSlide() {
                 public void set(int v) { step.speedPct = v; }
             }));
-            box.addView(Ui.sliderRow(a, "Volume for this step", 10, 100, step.volumePct, "%", new Ui.OnSlide() {
+            box.addView(Ui.sliderRow(a, "Volume for this step", 10, 100, step.volumePct, "%", 100,
+                    new Ui.OnSlide() {
                 public void set(int v) { step.volumePct = v; }
             }));
         }
@@ -4177,7 +4744,7 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
 
     private View row(final int index) {
         final Track t = Store.LIB.get(index);
-        boolean live = eng.st.running && eng.st.preview && eng.st.stepTitle.equals(t.shortTitle());
+        boolean live = eng.st.running && eng.st.preview && t.uri.equals(eng.st.trackUri);
 
         LinearLayout r = Ui.row(this);
         r.setBackground(Ui.ripple(Ui.rr(this, Ui.SURF2, 12)));
@@ -4531,8 +5098,10 @@ public final class AbDialog {
                 if (!ready[0]) return;
                 Ui.buzz(v);
                 try {
-                    if (mp.isPlaying()) { mp.pause(); Ui.setIcon(play, Ico.PLAY, Ui.ONACC); }
-                    else { mp.start(); Ui.setIcon(play, Ico.PAUSE, Ui.ONACC); }
+                    boolean wasPlaying = mp.isPlaying();
+                    if (wasPlaying) mp.pause(); else mp.start();
+                    Ui.setIcon(play, wasPlaying ? Ico.PLAY : Ico.PAUSE, Ui.ONACC);
+                    play.setContentDescription(wasPlaying ? "Play" : "Pause");
                 } catch (IllegalStateException e) { /* ignore */ }
             }
         });
@@ -4615,6 +5184,7 @@ public final class AbDialog {
                     boolean playing = false;
                     try { playing = mp.isPlaying(); } catch (IllegalStateException e) { /* ignore */ }
                     Ui.setIcon(play, playing ? Ico.PAUSE : Ico.PLAY, Ui.ONACC);
+                    play.setContentDescription(playing ? "Pause" : "Play");
                 }
                 h.postDelayed(this, 200);
             }
