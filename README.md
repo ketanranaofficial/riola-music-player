@@ -1,12 +1,16 @@
 # Riola
 
-A programmable music player for Android. You pick some tracks, write a short
-program that says what to play, how many times, which slice of a track, and how
-long to sit in silence — then hit run.
+A programmable music player for Android. Add some tracks, then build a program
+by tapping: play this whole track, loop that 40-second section eight times with
+a three-second rest between each, sit in silence for two minutes, repeat the
+whole thing four times.
 
-Built for practice loops, sleep/meditation sequences, interval training, ear
-training: anything where "play this bit for ten minutes, rest two, then the
-whole thing twice" is easier to write than to babysit.
+Built for practice loops, sleep and meditation sequences, interval training,
+ear training — anything where "play this bit for ten minutes, rest two, then
+the whole thing twice" is easier to set up once than to babysit.
+
+There is no scripting language and nothing to type. Every part of a program is
+a tap.
 
 ## The whole app is one script
 
@@ -28,72 +32,66 @@ JDK (17 works), and a debug keystore (the script creates one if missing).
 Everything under `riola/` is generated, so it is git-ignored. Edit the script,
 not the generated Java.
 
-## The language
+## How a program is built
 
-One command per line, case insensitive, `#` and `//` start comments. Tracks are
-addressed by the number shown next to them in the library.
+**Home** lists your saved programs, each with a play button. Tap a program to
+edit it, tap play to run it.
 
-```
-PLAY 0                            play track 0 once
-PLAY 0 3 TIMES                    ... three times   (also: x3)
-PLAY 0 FOR 20 MIN                 keep replaying it for twenty minutes
-LOOP 0 FOR 20 MIN                 same thing
+**A program** is an ordered list of steps plus a repeat count for the whole
+list (once, a few times, or forever).
 
-SECTION 1 0:30 1:15               play just that slice
-SECTION 1 0:30 1:15 8 TIMES       loop the slice eight times
-SECTION 1 0:30 1:15 FOR 12 MIN    loop the slice for twelve minutes
-SECTION 1 0:30-1:15 x8            dash form
-SECTION 1 2:00 END                from 2:00 to the end of the track
+**A step** is one of three things:
 
-PAUSE 5 MIN                       silence (also WAIT / SILENCE)
-PAUSE 90 SEC
-PAUSE 2:30
+| Step | What it does |
+| --- | --- |
+| Whole track | plays a track start to finish |
+| Section | plays one A-B slice of a track |
+| Silence | plays nothing |
 
-REPEAT 4                          repeat a block, nestable eight deep
-  SECTION 0 0:10 0:40 x2
-  PAUSE 30 SEC
-END
+Every playing step repeats either **a number of times** or **for a length of
+time**, and can carry a gap between repeats, its own speed, its own volume, and
+an on/off switch so you can park a step without deleting it.
 
-VOLUME 70                         these apply to the steps that follow
-SPEED 1.25
-FADE 200                          fade at every loop edge, in ms
-```
+**Sections** can be typed as minutes and seconds, or marked by ear: play the
+track, tap *Set A* and *Set B*, nudge each mark by a second, and loop the slice
+while you fine-tune it.
 
-Lengths accept `90 SEC`, `5 MIN`, `1.5 MIN`, `2:30`, `500 MS`, `1 HOUR`.
-Positions accept `0:30`, `1:02:05`, bare seconds, and `END`.
+## What else it does
 
-## What the app does
-
-- **Library** — add individual files or scan a whole folder (Storage Access
-  Framework, so no storage permission and the grants survive reboots).
-  Durations are read in the background.
-- **A-B picker** — audition a track, mark A and B by ear with 1s/5s nudges,
-  and drop a finished `SECTION` line into the program.
-- **Live step list** — every step with its estimated length; tap one to jump
-  there while running, or to start the program from there.
-- **Transport** — pause/resume, previous/next step, scrub, and a step list that
-  highlights where you are. Time left in the step and in the whole program.
+- **Library** — add files or scan a whole folder. Storage Access Framework, so
+  no storage permission, and the grants survive reboots. Durations are read in
+  the background; tracks can be renamed, reordered and previewed.
+- **Steps reference the track itself**, not its position, so reordering or
+  renaming the library never breaks a program. Remove a track a program uses
+  and the step is flagged *missing* and skipped rather than stopping the run.
 - **Background playback** — a foreground service with notification and lock
-  screen controls, audio focus handling (pauses for calls, ducks for
-  notifications), pause on headphone unplug, and an optional CPU wake lock so
-  long silences do not oversleep.
-- **Settings** — dark/light, keep screen on, master volume, playback speed,
-  loop-edge fade, and the safety toggles above.
-- **Saved programs** — name and reload as many programs as you like.
+  screen transport, MediaSession, audio focus handling (pauses for calls, ducks
+  for notifications), pause on headphone unplug, and an optional CPU wake lock
+  so long silences stay exact.
+- **While running** — pause/resume, previous/next step, tap any step to jump to
+  it, scrub inside the current track, and see time left in the step and in the
+  whole program.
+- **Settings** — dark/light, keep screen on, master volume and speed, loop-edge
+  fade, a count-in before the first step, and a stop-after timer.
 
-Nothing leaves the phone: no network permission, no accounts, no analytics.
+No network permission, no accounts, no analytics. Nothing leaves the phone.
 
 ## Layout of the generated code
 
 | File | What it does |
 | --- | --- |
-| `MainActivity` | the whole screen, built programmatically |
+| `MainActivity` | home: saved programs, live step list, settings |
+| `EditorActivity` | the tap-to-build program editor |
+| `LibraryActivity` | the track library |
+| `StepSheet` | the editor for one step |
+| `AbDialog` | mark a section by ear |
+| `Pickers` | track / length / position / name dialogs |
+| `PlayerBar` | the shared transport strip |
 | `Engine` | worker thread + one `MediaPlayer`, runs the step list |
 | `PlayerService` | foreground service, notification, MediaSession, audio focus |
-| `Parser` / `Cmd` | the script language |
+| `Program` / `Step` | the data model |
 | `Store` / `Prefs` | persistence (SharedPreferences + JSON) |
 | `Ui` / `Ico` | palette, widget factory, hand-drawn vector icons |
-| `AbDialog` | the A-B section picker |
-| `Fmt` / `HelpText` | formatting and the in-app reference |
+| `Fmt` / `HelpText` | formatting and the in-app guide |
 
-Min SDK 26, target SDK 34.
+Min SDK 26, target SDK 34. Tested on a Galaxy A55 running Android 16.

@@ -23,7 +23,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $OutDir      = (Join-Path $PSScriptRoot 'riola'),
+    [string] $OutDir      = '',
     [string] $ApkName     = 'riola.apk',
     [switch] $SourcesOnly,
     [switch] $Install,
@@ -33,6 +33,17 @@ param(
 $ErrorActionPreference = 'Stop'
 $PKG      = 'com.riola.player'
 $PKG_PATH = 'com\riola\player'
+
+# $PSScriptRoot is empty when the script is piped in or invoked oddly, so fall
+# back to the working directory.
+if (-not $OutDir -or $OutDir.Length -eq 0) {
+    $base = $PSScriptRoot
+    if (-not $base -or $base.Length -eq 0) {
+        try { $base = Split-Path -Parent $MyInvocation.MyCommand.Path } catch { $base = '' }
+    }
+    if (-not $base -or $base.Length -eq 0) { $base = (Get-Location).Path }
+    $OutDir = Join-Path $base 'riola'
+}
 
 function Say  ([string]$m) { Write-Host $m -ForegroundColor Cyan }
 function Ok   ([string]$m) { Write-Host $m -ForegroundColor Green }
@@ -84,6 +95,11 @@ Write-Host ("  out dir      : " + $OutDir)
 if ($Clean -and (Test-Path $OutDir)) { Say "`n[clean] removing $OutDir"; Remove-Item -Recurse -Force $OutDir }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
+# The generated tree is rewritten from scratch every run, so a source file that
+# this script no longer emits can never linger and break the build.
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $OutDir $PKG_PATH)
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $OutDir 'res')
+
 function Write-Src([string]$Rel, [string]$Body) {
     $full = Join-Path $OutDir $Rel
     $dir  = Split-Path $full -Parent
@@ -131,6 +147,20 @@ Write-Src 'AndroidManifest.xml' @'
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".EditorActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".LibraryActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode"
+            android:windowSoftInputMode="adjustResize" />
 
         <service
             android:name=".PlayerService"
@@ -260,7 +290,7 @@ Write-Src 'res\drawable\ic_prev.xml' @'
 '@
 
 # ---------------------------------------------------------------------------
-# Java: small utilities and model
+# Java: model and storage
 # ---------------------------------------------------------------------------
 Write-Src "$PKG_PATH\Fmt.java" @'
 package com.riola.player;
@@ -289,12 +319,31 @@ public final class Fmt {
         return s + "s";
     }
 
+    /** 45 sec / 3 min / 1 hr 5 min - for compact captions. */
+    public static String rough(long v) {
+        if (v <= 0) return "0 min";
+        long t = (v + 500L) / 1000L;
+        long h = t / 3600L, m = (t % 3600L) / 60L, s = t % 60L;
+        if (h > 0) return m > 0 ? (h + " hr " + m + " min") : (h + " hr");
+        if (m > 0) return m + " min";
+        return s + " sec";
+    }
+
     public static String two(long v) { return v < 10 ? "0" + v : Long.toString(v); }
 
     /** 1.25 -> "1.25x" without locale surprises. */
-    public static String speed(float v) {
-        int hundredths = Math.round(v * 100f);
-        return (hundredths / 100) + "." + two(hundredths % 100) + "x";
+    public static String speed(int pct) {
+        return (pct / 100) + "." + two(pct % 100) + "x";
+    }
+
+    public static String ago(long when) {
+        if (when <= 0) return "never";
+        long d = System.currentTimeMillis() - when;
+        if (d < 60000L) return "just now";
+        if (d < 3600000L) return (d / 60000L) + " min ago";
+        if (d < 86400000L) return (d / 3600000L) + " hr ago";
+        long days = d / 86400000L;
+        return days == 1 ? "yesterday" : (days + " days ago");
     }
 }
 '@
@@ -327,87 +376,247 @@ public class Track {
 }
 '@
 
-Write-Src "$PKG_PATH\Cmd.java" @'
+Write-Src "$PKG_PATH\Step.java" @'
 package com.riola.player;
 
+import org.json.JSONObject;
+
+/** One step of a program. Tracks are referenced by uri so reordering the library is safe. */
+public class Step {
+
+    public static final int PLAY = 0, SECTION = 1, SILENCE = 2;
+
+    public int type = PLAY;
+    public String trackUri = "";
+    public String trackName = "";   // remembered so a missing file still reads sensibly
+    public long a = 0;              // section start
+    public long b = -1;             // section end, -1 = end of track
+    public int times = 1;           // -1 = run until durMs is used up
+    public long durMs = 0;          // silence length, or the time budget when times < 0
+    public long gapMs = 0;          // rest between repeats
+    public int speedPct = 100;
+    public int volumePct = 100;
+    public boolean enabled = true;
+
+    public static Step play(Track t) {
+        Step s = new Step();
+        s.type = PLAY;
+        s.bind(t);
+        return s;
+    }
+
+    public static Step section(Track t, long a, long b) {
+        Step s = new Step();
+        s.type = SECTION;
+        s.bind(t);
+        s.a = a;
+        s.b = b;
+        return s;
+    }
+
+    public static Step silence(long ms) {
+        Step s = new Step();
+        s.type = SILENCE;
+        s.durMs = ms;
+        return s;
+    }
+
+    public void bind(Track t) {
+        if (t == null) return;
+        trackUri = t.uri;
+        trackName = t.shortTitle();
+    }
+
+    public Track track() { return type == SILENCE ? null : Store.byUri(trackUri); }
+
+    public boolean missing() { return type != SILENCE && track() == null; }
+
+    public boolean timed() { return times < 0; }
+
+    public String title() {
+        if (type == SILENCE) return "Silence";
+        Track t = track();
+        if (t != null) return t.shortTitle();
+        return (trackName == null || trackName.length() == 0) ? "Missing track" : trackName;
+    }
+
+    /** The one line under the title in the step list. */
+    public String detail() {
+        StringBuilder sb = new StringBuilder();
+        if (type == SILENCE) {
+            sb.append("rest for ").append(Fmt.rough(durMs));
+            return sb.toString();
+        }
+        if (type == SECTION) sb.append(Fmt.ms(a)).append(" - ").append(b < 0 ? "end" : Fmt.ms(b));
+        else sb.append("whole track");
+        sb.append("  .  ");
+        if (timed()) sb.append("loop for ").append(Fmt.rough(durMs));
+        else sb.append(times == 1 ? "once" : (times + " times"));
+        if (gapMs > 0) sb.append("  .  ").append(Fmt.rough(gapMs)).append(" gap");
+        if (speedPct != 100) sb.append("  .  ").append(Fmt.speed(speedPct));
+        if (volumePct != 100) sb.append("  .  vol ").append(volumePct).append("%");
+        return sb.toString();
+    }
+
+    public long lengthMs() {
+        Track t = track();
+        long full = t == null ? 0 : t.durMs;
+        if (type == SECTION) {
+            long end = b < 0 ? full : b;
+            return Math.max(0, end - a);
+        }
+        return full;
+    }
+
+    /** Estimated wall clock time for this step. */
+    public long estMs() {
+        if (!enabled) return 0;
+        if (type == SILENCE) return durMs;
+        if (timed()) return durMs;
+        long one = lengthMs();
+        if (speedPct > 0 && speedPct != 100) one = one * 100L / speedPct;
+        int n = Math.max(1, times);
+        return one * n + gapMs * Math.max(0, n - 1);
+    }
+
+    public Step copy() {
+        Step s = new Step();
+        s.type = type; s.trackUri = trackUri; s.trackName = trackName;
+        s.a = a; s.b = b; s.times = times; s.durMs = durMs; s.gapMs = gapMs;
+        s.speedPct = speedPct; s.volumePct = volumePct; s.enabled = enabled;
+        return s;
+    }
+
+    public JSONObject toJson() throws Exception {
+        JSONObject o = new JSONObject();
+        o.put("ty", type);
+        o.put("u", trackUri);
+        o.put("n", trackName);
+        o.put("a", a);
+        o.put("b", b);
+        o.put("x", times);
+        o.put("d", durMs);
+        o.put("g", gapMs);
+        o.put("sp", speedPct);
+        o.put("vo", volumePct);
+        o.put("en", enabled);
+        return o;
+    }
+
+    public static Step fromJson(JSONObject o) {
+        Step s = new Step();
+        s.type = o.optInt("ty", PLAY);
+        s.trackUri = o.optString("u", "");
+        s.trackName = o.optString("n", "");
+        s.a = o.optLong("a", 0);
+        s.b = o.optLong("b", -1);
+        s.times = o.optInt("x", 1);
+        s.durMs = o.optLong("d", 0);
+        s.gapMs = o.optLong("g", 0);
+        s.speedPct = o.optInt("sp", 100);
+        s.volumePct = o.optInt("vo", 100);
+        s.enabled = o.optBoolean("en", true);
+        return s;
+    }
+}
+'@
+
+Write-Src "$PKG_PATH\Program.java" @'
+package com.riola.player;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.util.ArrayList;
 import java.util.List;
 
-/** One step of a program. */
-public class Cmd {
+/** A named list of steps. */
+public class Program {
 
-    public static final int PLAY     = 0;  // whole track, N times or for a duration
-    public static final int PAUSE    = 1;  // silence
-    public static final int SECTION  = 2;  // a-b region, N times or for a duration
-    public static final int VOLUME   = 3;
-    public static final int SPEED    = 4;
-    public static final int FADE     = 5;
+    public String id;
+    public String name;
+    public final List<Step> steps = new ArrayList<Step>();
+    public int loops = 1;          // -1 = keep repeating the whole program
+    public long updated;
+    public long lastRun;
 
-    public int  type;
-    public int  track = -1;
-    public int  times = 1;      // -1 = until the time budget runs out
-    public long a = 0;          // section start (ms)
-    public long b = -1;         // section end (ms), -1 = end of track
-    public long durMs = 0;      // time budget / pause length
-    public int  value;          // VOLUME 0-100, SPEED percent, FADE ms
-    public int  line;           // source line number
-
-    public Cmd copy() {
-        Cmd c = new Cmd();
-        c.type = type; c.track = track; c.times = times; c.a = a; c.b = b;
-        c.durMs = durMs; c.value = value; c.line = line;
-        return c;
+    public Program(String id, String name) {
+        this.id = id;
+        this.name = name;
+        this.updated = System.currentTimeMillis();
     }
 
-    public String trackTitle() {
-        List<Track> lib = Store.LIB;
-        if (track < 0 || track >= lib.size()) return "track " + track + " (missing)";
-        return lib.get(track).shortTitle();
+    public static Program blank(String name) {
+        return new Program(Long.toHexString(System.currentTimeMillis()) + Integer.toHexString((int) (Math.random() * 65536)), name);
     }
 
-    /** Short human label used in the step list, notification and log. */
-    public String label() {
-        switch (type) {
-            case PAUSE:
-                return "Silence for " + Fmt.human(durMs);
-            case VOLUME:
-                return "Set volume to " + value + "%";
-            case SPEED:
-                return "Set speed to " + Fmt.speed(value / 100f);
-            case FADE:
-                return "Set edge fade to " + value + " ms";
-            case SECTION:
-                return "[" + track + "] " + trackTitle() + "  " + Fmt.ms(a) + "-"
-                        + (b < 0 ? "end" : Fmt.ms(b)) + "  " + repeatText();
-            default:
-                return "[" + track + "] " + trackTitle() + "  full track  " + repeatText();
-        }
+    public int enabledCount() {
+        int n = 0;
+        for (int i = 0; i < steps.size(); i++) if (steps.get(i).enabled) n++;
+        return n;
     }
 
-    private String repeatText() {
-        if (durMs > 0) return "looped for " + Fmt.human(durMs);
-        if (times == 1) return "once";
-        return times + "x";
+    /** One pass through the enabled steps. */
+    public long passMs() {
+        long t = 0;
+        for (int i = 0; i < steps.size(); i++) t += steps.get(i).estMs();
+        return t;
     }
 
-    /** Rough length of this step, for the "program lasts about N" estimate. */
     public long estMs() {
-        if (type == PAUSE) return durMs;
-        if (type == VOLUME || type == SPEED || type == FADE) return 0;
-        if (durMs > 0) return durMs;
-        long span;
-        if (type == SECTION) {
-            long end = b < 0 ? trackDur() : b;
-            span = Math.max(0, end - a);
-        } else {
-            span = trackDur();
-        }
-        return span * Math.max(1, times);
+        return passMs() * (loops < 0 ? 1 : Math.max(1, loops));
     }
 
-    private long trackDur() {
-        List<Track> lib = Store.LIB;
-        if (track < 0 || track >= lib.size()) return 0;
-        return lib.get(track).durMs;
+    public boolean hasMissing() {
+        for (int i = 0; i < steps.size(); i++) if (steps.get(i).enabled && steps.get(i).missing()) return true;
+        return false;
+    }
+
+    public String summary() {
+        int n = enabledCount();
+        if (n == 0) return "no steps yet";
+        String s = n + (n == 1 ? " step" : " steps");
+        long t = estMs();
+        if (t > 0) s = s + "  .  " + (loops < 0 ? "repeats forever" : ("about " + Fmt.rough(t)));
+        else if (loops < 0) s = s + "  .  repeats forever";
+        if (loops > 1) s = s + "  .  " + loops + " loops";
+        return s;
+    }
+
+    public Program copyAs(String newName) {
+        Program p = Program.blank(newName);
+        p.loops = loops;
+        for (int i = 0; i < steps.size(); i++) p.steps.add(steps.get(i).copy());
+        return p;
+    }
+
+    public JSONObject toJson() throws Exception {
+        JSONObject o = new JSONObject();
+        o.put("id", id);
+        o.put("nm", name);
+        o.put("lp", loops);
+        o.put("up", updated);
+        o.put("lr", lastRun);
+        JSONArray arr = new JSONArray();
+        for (int i = 0; i < steps.size(); i++) arr.put(steps.get(i).toJson());
+        o.put("st", arr);
+        return o;
+    }
+
+    public static Program fromJson(JSONObject o) {
+        Program p = new Program(o.optString("id", Long.toHexString(System.nanoTime())),
+                                o.optString("nm", "Program"));
+        p.loops = o.optInt("lp", 1);
+        p.updated = o.optLong("up", 0);
+        p.lastRun = o.optLong("lr", 0);
+        JSONArray arr = o.optJSONArray("st");
+        if (arr != null) {
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject s = arr.optJSONObject(i);
+                if (s != null) p.steps.add(Step.fromJson(s));
+            }
+        }
+        return p;
     }
 }
 '@
@@ -434,30 +643,32 @@ public class Prefs {
     public boolean wakeLock()      { return sp.getBoolean("wake", true); }
     public boolean pauseUnplug()   { return sp.getBoolean("unplug", true); }
     public boolean pauseOnFocus()  { return sp.getBoolean("focus", true); }
-    public boolean autoSave()      { return sp.getBoolean("autosave", true); }
-    public boolean showLog()       { return sp.getBoolean("showlog", true); }
+    public boolean haptics()       { return sp.getBoolean("haptics", true); }
     public int     fadeMs()        { return sp.getInt("fade", 150); }
     public int     volume()        { return sp.getInt("vol", 100); }
     public int     speedPct()      { return sp.getInt("speed", 100); }
-    public boolean seeded()        { return sp.getBoolean("seeded", false); }
-    public void    seeded(boolean v) { sp.edit().putBoolean("seeded", v).apply(); }
+    public int     countIn()       { return sp.getInt("countin", 0); }      // seconds
+    public int     autoStopMin()   { return sp.getInt("autostop", 0); }     // 0 = off
     public float   speed()         { return speedPct() / 100f; }
+    public boolean seeded()        { return sp.getBoolean("seeded2", false); }
 
     public void dark(boolean v)         { sp.edit().putBoolean("dark", v).apply(); }
     public void keepScreenOn(boolean v) { sp.edit().putBoolean("keepOn", v).apply(); }
     public void wakeLock(boolean v)     { sp.edit().putBoolean("wake", v).apply(); }
     public void pauseUnplug(boolean v)  { sp.edit().putBoolean("unplug", v).apply(); }
     public void pauseOnFocus(boolean v) { sp.edit().putBoolean("focus", v).apply(); }
-    public void autoSave(boolean v)     { sp.edit().putBoolean("autosave", v).apply(); }
-    public void showLog(boolean v)      { sp.edit().putBoolean("showlog", v).apply(); }
+    public void haptics(boolean v)      { sp.edit().putBoolean("haptics", v).apply(); }
     public void fadeMs(int v)           { sp.edit().putInt("fade", v).apply(); }
     public void volume(int v)           { sp.edit().putInt("vol", v).apply(); }
     public void speedPct(int v)         { sp.edit().putInt("speed", v).apply(); }
+    public void countIn(int v)          { sp.edit().putInt("countin", v).apply(); }
+    public void autoStopMin(int v)      { sp.edit().putInt("autostop", v).apply(); }
+    public void seeded(boolean v)       { sp.edit().putBoolean("seeded2", v).apply(); }
 
     public void resetAll() {
         sp.edit().remove("keepOn").remove("wake").remove("unplug").remove("focus")
-          .remove("autosave").remove("showlog")
-          .remove("fade").remove("vol").remove("speed").apply();
+          .remove("haptics").remove("fade").remove("vol").remove("speed")
+          .remove("countin").remove("autostop").apply();
     }
 }
 '@
@@ -471,17 +682,17 @@ import android.content.SharedPreferences;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Iterator;
+import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-/** Persistent state: track library, current script, saved programs. */
+/** Persistent state: the track library and the saved programs. */
 public final class Store {
 
-    /** Shared by the UI and the playback engine (same process). */
+    /** Shared by every screen and by the playback engine (one process). */
     public static final CopyOnWriteArrayList<Track> LIB = new CopyOnWriteArrayList<Track>();
+    public static final CopyOnWriteArrayList<Program> PROGRAMS = new CopyOnWriteArrayList<Program>();
 
     private static boolean loaded = false;
 
@@ -495,15 +706,34 @@ public final class Store {
         if (loaded) return;
         loaded = true;
         LIB.clear();
+        PROGRAMS.clear();
         try {
             JSONArray arr = new JSONArray(sp(c).getString("lib", "[]"));
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.getJSONObject(i);
                 LIB.add(new Track(o.getString("u"), o.optString("t", "track"), o.optLong("d", 0)));
             }
-        } catch (Exception e) {
-            LIB.clear();
-        }
+        } catch (Exception e) { LIB.clear(); }
+        try {
+            JSONArray arr = new JSONArray(sp(c).getString("programs", "[]"));
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i);
+                if (o != null) PROGRAMS.add(Program.fromJson(o));
+            }
+        } catch (Exception e) { PROGRAMS.clear(); }
+        sortPrograms();
+    }
+
+    // ---- library ---------------------------------------------------------
+    public static Track byUri(String uri) {
+        if (uri == null || uri.length() == 0) return null;
+        for (Track t : LIB) if (uri.equals(t.uri)) return t;
+        return null;
+    }
+
+    public static int indexOf(String uri) {
+        for (int i = 0; i < LIB.size(); i++) if (LIB.get(i).uri.equals(uri)) return i;
+        return -1;
     }
 
     public static void saveLib(Context c) {
@@ -520,45 +750,72 @@ public final class Store {
         sp(c).edit().putString("lib", arr.toString()).apply();
     }
 
-    public static String script(Context c)           { return sp(c).getString("script", ""); }
-    public static void   script(Context c, String v) { sp(c).edit().putString("script", v).apply(); }
-
-    // ---- saved programs -------------------------------------------------
-    private static JSONObject progs(Context c) {
-        try { return new JSONObject(sp(c).getString("progs", "{}")); }
-        catch (Exception e) { return new JSONObject(); }
+    // ---- programs --------------------------------------------------------
+    public static void sortPrograms() {
+        List<Program> copy = new java.util.ArrayList<Program>(PROGRAMS);
+        Collections.sort(copy, new Comparator<Program>() {
+            public int compare(Program x, Program y) {
+                long a = Math.max(x.updated, x.lastRun), b = Math.max(y.updated, y.lastRun);
+                return a == b ? 0 : (a > b ? -1 : 1);
+            }
+        });
+        PROGRAMS.clear();
+        PROGRAMS.addAll(copy);
     }
 
-    public static List<String> programNames(Context c) {
-        List<String> out = new ArrayList<String>();
-        JSONObject o = progs(c);
-        for (Iterator<String> it = o.keys(); it.hasNext(); ) out.add(it.next());
-        Collections.sort(out, String.CASE_INSENSITIVE_ORDER);
-        return out;
+    public static Program program(String id) {
+        if (id == null) return null;
+        for (Program p : PROGRAMS) if (p.id.equals(id)) return p;
+        return null;
     }
 
-    public static String program(Context c, String name) { return progs(c).optString(name, ""); }
-
-    public static void saveProgram(Context c, String name, String body) {
-        JSONObject o = progs(c);
-        try { o.put(name, body); } catch (Exception e) { return; }
-        sp(c).edit().putString("progs", o.toString()).apply();
+    public static void put(Context c, Program p) {
+        p.updated = System.currentTimeMillis();
+        if (program(p.id) == null) PROGRAMS.add(p);
+        savePrograms(c);
     }
 
-    public static void deleteProgram(Context c, String name) {
-        JSONObject o = progs(c);
-        o.remove(name);
-        sp(c).edit().putString("progs", o.toString()).apply();
+    public static void delete(Context c, Program p) {
+        PROGRAMS.remove(p);
+        savePrograms(c);
+    }
+
+    public static void savePrograms(Context c) {
+        sortPrograms();
+        JSONArray arr = new JSONArray();
+        for (Program p : PROGRAMS) {
+            try { arr.put(p.toJson()); } catch (Exception e) { /* skip */ }
+        }
+        sp(c).edit().putString("programs", arr.toString()).apply();
+    }
+
+    /** A ready made program so a new user can hear something immediately. */
+    public static Program sample() {
+        Program p = Program.blank("My first program");
+        if (LIB.size() > 0) {
+            Track t = LIB.get(0);
+            Step warm = Step.play(t);
+            p.steps.add(warm);
+            p.steps.add(Step.silence(60000));
+            long end = t.durMs > 90000 ? 90000 : Math.max(20000, t.durMs / 2);
+            Step drill = Step.section(t, 30000, end);
+            drill.times = 4;
+            drill.gapMs = 3000;
+            p.steps.add(drill);
+        }
+        return p;
     }
 }
 '@
 
 # ---------------------------------------------------------------------------
-# Java: theme + widget factory + hand drawn icons
+# Java: theme, widget factory, hand drawn icons
 # ---------------------------------------------------------------------------
 Write-Src "$PKG_PATH\Ui.java" @'
 package com.riola.player;
 
+import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Context;
 import android.content.res.ColorStateList;
 import android.graphics.Typeface;
@@ -567,22 +824,36 @@ import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.text.TextUtils;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.CompoundButton;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.SeekBar;
+import android.widget.Switch;
 import android.widget.TextView;
+import android.widget.Toast;
 
 /**
- * A very small design system: one palette plus factory methods for the few
- * widgets the app needs. Nothing here depends on AndroidX or on XML layouts.
+ * A very small design system: one palette plus factory methods for the widgets
+ * the app needs. No AndroidX, no XML layouts.
  */
 public final class Ui {
 
     public static final int PRIMARY = 0, SECONDARY = 1, DANGER = 2, GHOST = 3;
+    public static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
+    public static final int WRAP  = ViewGroup.LayoutParams.WRAP_CONTENT;
+
+    public interface OnToggle { void set(boolean v); }
+    public interface OnSlide  { void set(int v); }
+    public interface OnValue  { void set(int v); }
+    public interface OnPick   { void set(int index); }
 
     public static boolean dark = true;
-    public static int BG, SURF, SURF2, LINE, TXT, DIM, ACC, ACC2, RED, GREEN, AMBER, RIPPLE, ONACC;
+    public static int BG, SURF, SURF2, LINE, TXT, DIM, ACC, ACC2, RED, GREEN, AMBER, RIPPLE, ONACC, FIELD;
 
     private Ui() { }
 
@@ -592,17 +863,40 @@ public final class Ui {
             BG    = 0xFF0E1116; SURF  = 0xFF161C24; SURF2 = 0xFF1E2630; LINE  = 0xFF2C3542;
             TXT   = 0xFFE8EDF3; DIM   = 0xFF93A1B0; ACC   = 0xFF4CC2FF; ACC2  = 0xFF8B7CFF;
             RED   = 0xFFFF6B6B; GREEN = 0xFF3DDC97; AMBER = 0xFFFFC65C;
-            RIPPLE = 0x33FFFFFF; ONACC = 0xFF06131C;
+            RIPPLE = 0x33FFFFFF; ONACC = 0xFF06131C; FIELD = 0xFF0B0F14;
         } else {
             BG    = 0xFFF4F6FA; SURF  = 0xFFFFFFFF; SURF2 = 0xFFEDF1F7; LINE  = 0xFFD6DEE8;
             TXT   = 0xFF12181F; DIM   = 0xFF5A6673; ACC   = 0xFF0A7FC7; ACC2  = 0xFF5B4BE0;
             RED   = 0xFFD03A3A; GREEN = 0xFF10875A; AMBER = 0xFFA97400;
-            RIPPLE = 0x22000000; ONACC = 0xFFFFFFFF;
+            RIPPLE = 0x22000000; ONACC = 0xFFFFFFFF; FIELD = 0xFFF8FAFC;
         }
     }
 
     public static int dp(Context c, float v) {
         return Math.round(v * c.getResources().getDisplayMetrics().density);
+    }
+
+    public static void applyWindow(Activity a) {
+        a.getWindow().setStatusBarColor(BG);
+        a.getWindow().setNavigationBarColor(BG);
+        int flags = dark ? 0 : (View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+        a.getWindow().getDecorView().setSystemUiVisibility(flags);
+    }
+
+    public static int themeRes(boolean isDark) {
+        return isDark ? android.R.style.Theme_Material_NoActionBar
+                      : android.R.style.Theme_Material_Light_NoActionBar;
+    }
+
+    public static AlertDialog.Builder dialog(Activity a) {
+        return new AlertDialog.Builder(a, dark ? android.R.style.Theme_Material_Dialog_Alert
+                                               : android.R.style.Theme_Material_Light_Dialog_Alert);
+    }
+
+    public static void toast(Context c, String s) { Toast.makeText(c, s, Toast.LENGTH_SHORT).show(); }
+
+    public static void buzz(View v) {
+        try { v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY); } catch (Exception e) { }
     }
 
     // ---- drawables -------------------------------------------------------
@@ -623,14 +917,6 @@ public final class Ui {
         return new RippleDrawable(ColorStateList.valueOf(RIPPLE), content, null);
     }
 
-    public static Drawable circle(Context c, int fill, int sizeDp) {
-        GradientDrawable g = new GradientDrawable();
-        g.setShape(GradientDrawable.OVAL);
-        g.setColor(fill);
-        g.setSize(dp(c, sizeDp), dp(c, sizeDp));
-        return g;
-    }
-
     // ---- layout params ---------------------------------------------------
     public static LinearLayout.LayoutParams lp(int w, int h) {
         return new LinearLayout.LayoutParams(w, h);
@@ -640,15 +926,17 @@ public final class Ui {
         return new LinearLayout.LayoutParams(w, h, weight);
     }
 
-    public static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
-    public static final int WRAP  = ViewGroup.LayoutParams.WRAP_CONTENT;
-
     public static View margin(Context c, View v, float l, float t, float r, float b) {
         ViewGroup.LayoutParams p = v.getLayoutParams();
         LinearLayout.LayoutParams lp = (p instanceof LinearLayout.LayoutParams)
                 ? (LinearLayout.LayoutParams) p : new LinearLayout.LayoutParams(MATCH, WRAP);
         lp.setMargins(dp(c, l), dp(c, t), dp(c, r), dp(c, b));
         v.setLayoutParams(lp);
+        return v;
+    }
+
+    public static View weight(View v, float w) {
+        v.setLayoutParams(lpw(0, WRAP, w));
         return v;
     }
 
@@ -677,9 +965,30 @@ public final class Ui {
         return l;
     }
 
+    /** A scrolling body that stretches between the header and whatever is pinned below. */
+    public static ScrollView scroller(Context c, LinearLayout body) {
+        ScrollView sv = new ScrollView(c);
+        sv.setLayoutParams(lpw(MATCH, 0, 1f));
+        sv.setFillViewport(true);
+        sv.addView(body, new FrameLayout.LayoutParams(MATCH, WRAP));
+        return sv;
+    }
+
     public static View gap(Context c, float h) {
         View v = new View(c);
         v.setLayoutParams(lp(MATCH, dp(c, h)));
+        return v;
+    }
+
+    public static View hgap(Context c, float w) {
+        View v = new View(c);
+        v.setLayoutParams(lp(dp(c, w), 1));
+        return v;
+    }
+
+    public static View spring(Context c) {
+        View v = new View(c);
+        v.setLayoutParams(lpw(0, 1, 1f));
         return v;
     }
 
@@ -709,13 +1018,14 @@ public final class Ui {
         return t;
     }
 
-    /** Small upper-case section heading with an icon. */
     public static LinearLayout heading(Context c, int icoId, String text) {
         LinearLayout r = row(c);
-        r.addView(icon(c, icoId, ACC, 16));
+        if (icoId > 0) {
+            r.addView(icon(c, icoId, ACC, 16));
+            r.addView(hgap(c, 8));
+        }
         TextView t = tv(c, text.toUpperCase(), 12, DIM, true);
         t.setLetterSpacing(0.12f);
-        margin(c, t, 8, 0, 0, 0);
         r.addView(t);
         margin(c, r, 0, 0, 0, 8);
         return r;
@@ -729,6 +1039,11 @@ public final class Ui {
         return t;
     }
 
+    public static void ellipsize(TextView t) {
+        t.setSingleLine(true);
+        t.setEllipsize(TextUtils.TruncateAt.END);
+    }
+
     // ---- icons and buttons ----------------------------------------------
     public static ImageView icon(Context c, int icoId, int color, int sizeDp) {
         ImageView v = new ImageView(c);
@@ -737,20 +1052,25 @@ public final class Ui {
         return v;
     }
 
-    public static ImageView iconBtn(Context c, int icoId, int color, int sizeDp, View.OnClickListener l) {
+    public static ImageView iconBtn(Context c, int icoId, int color, int sizeDp, String describe, View.OnClickListener l) {
+        return iconBtn(c, icoId, color, sizeDp, 9, describe, l);
+    }
+
+    public static ImageView iconBtn(Context c, int icoId, int color, int sizeDp, int padDp,
+                                    String describe, View.OnClickListener l) {
         ImageView v = new ImageView(c);
         v.setImageDrawable(new Ico(icoId, color));
-        int pad = dp(c, 9);
+        int pad = dp(c, padDp);
         v.setPadding(pad, pad, pad, pad);
         int total = dp(c, sizeDp) + pad * 2;
         v.setLayoutParams(lp(total, total));
         v.setBackground(ripple(rr(c, 0x00000000, 40)));
+        v.setContentDescription(describe);
         v.setOnClickListener(l);
         return v;
     }
 
-    /** Big round transport button. */
-    public static ImageView roundBtn(Context c, int icoId, int sizeDp, boolean filled, View.OnClickListener l) {
+    public static ImageView roundBtn(Context c, int icoId, int sizeDp, boolean filled, String describe, View.OnClickListener l) {
         ImageView v = new ImageView(c);
         v.setImageDrawable(new Ico(icoId, filled ? ONACC : TXT));
         int pad = dp(c, filled ? 15 : 12);
@@ -762,6 +1082,7 @@ public final class Ui {
         g.setColor(filled ? ACC : SURF2);
         if (!filled) g.setStroke(Math.max(1, dp(c, 1)), LINE);
         v.setBackground(ripple(g));
+        v.setContentDescription(describe);
         v.setOnClickListener(l);
         return v;
     }
@@ -796,14 +1117,14 @@ public final class Ui {
             t.setSingleLine(true);
             b.addView(t);
         }
+        if (text != null) b.setContentDescription(text);
         return b;
     }
 
-    /** Rounded pill used for script snippets. */
-    public static TextView chip(Context c, String text, View.OnClickListener l) {
-        TextView t = tv(c, text, 12, ACC, true);
-        t.setPadding(dp(c, 12), dp(c, 7), dp(c, 12), dp(c, 7));
-        t.setBackground(ripple(rrs(c, SURF2, LINE, 20, 1)));
+    public static TextView chip(Context c, String text, boolean on, View.OnClickListener l) {
+        TextView t = tv(c, text, 12, on ? ONACC : DIM, true);
+        t.setPadding(dp(c, 13), dp(c, 8), dp(c, 13), dp(c, 8));
+        t.setBackground(ripple(rrs(c, on ? ACC : SURF2, on ? ACC : LINE, 20, 1)));
         t.setOnClickListener(l);
         t.setSingleLine(true);
         LinearLayout.LayoutParams p = lp(WRAP, WRAP);
@@ -812,9 +1133,179 @@ public final class Ui {
         return t;
     }
 
-    public static void ellipsize(TextView t) {
-        t.setSingleLine(true);
-        t.setEllipsize(TextUtils.TruncateAt.END);
+    // ---- composite rows --------------------------------------------------
+    /** Screen header: optional back arrow, title, subtitle, trailing action views. */
+    public static LinearLayout appBar(final Activity a, int icoId, String title, String sub, boolean back, View[] actions) {
+        LinearLayout h = row(a);
+        h.setPadding(dp(a, back ? 4 : 16), dp(a, 12), dp(a, 8), dp(a, 8));
+        if (back) {
+            h.addView(iconBtn(a, Ico.BACK, TXT, 20, "Back", new View.OnClickListener() {
+                public void onClick(View v) { a.finish(); }
+            }));
+        } else if (icoId > 0) {
+            ImageView mark = icon(a, icoId, ACC, 20);
+            int p = dp(a, 7);
+            mark.setPadding(p, p, p, p);
+            mark.setLayoutParams(lp(dp(a, 34), dp(a, 34)));
+            mark.setBackground(rr(a, SURF2, 10));
+            h.addView(mark);
+            h.addView(hgap(a, 10));
+        }
+        LinearLayout titles = col(a);
+        titles.setLayoutParams(lpw(0, WRAP, 1f));
+        TextView t = tv(a, title, back ? 17 : 20, TXT, true);
+        ellipsize(t);
+        titles.addView(t);
+        if (sub != null && sub.length() > 0) {
+            TextView s = tv(a, sub, 11, DIM, false);
+            ellipsize(s);
+            titles.addView(s);
+        }
+        h.addView(titles);
+        if (actions != null) for (View v : actions) if (v != null) h.addView(v);
+        return h;
+    }
+
+    public static LinearLayout emptyState(Context c, int icoId, String title, String body) {
+        LinearLayout box = col(c);
+        box.setGravity(Gravity.CENTER_HORIZONTAL);
+        box.setPadding(dp(c, 24), dp(c, 26), dp(c, 24), dp(c, 26));
+        ImageView i = icon(c, icoId, LINE, 42);
+        box.addView(i);
+        TextView t = tv(c, title, 15, TXT, true);
+        margin(c, t, 0, 12, 0, 0);
+        t.setGravity(Gravity.CENTER);
+        box.addView(t);
+        TextView b = tv(c, body, 12.5f, DIM, false);
+        b.setGravity(Gravity.CENTER);
+        margin(c, b, 0, 6, 0, 0);
+        box.addView(b);
+        return box;
+    }
+
+    public static View switchRow(Context c, String label, String sub, boolean value, final OnToggle cb) {
+        LinearLayout r = row(c);
+        margin(c, r, 0, 6, 0, 6);
+        LinearLayout col = col(c);
+        col.setLayoutParams(lpw(0, WRAP, 1f));
+        col.addView(tv(c, label, 14, TXT, false));
+        if (sub != null && sub.length() > 0) {
+            TextView s = tv(c, sub, 11.5f, DIM, false);
+            col.addView(s);
+        }
+        r.addView(col);
+        Switch s = new Switch(c);
+        s.setChecked(value);
+        s.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            public void onCheckedChanged(CompoundButton b, boolean v) { cb.set(v); }
+        });
+        r.addView(s);
+        return r;
+    }
+
+    public static View sliderRow(Context c, String label, final int min, int max, int value,
+                                 final String unit, final OnSlide cb) {
+        LinearLayout box = col(c);
+        margin(c, box, 0, 6, 0, 2);
+        LinearLayout head = row(c);
+        TextView t = tv(c, label, 14, TXT, false);
+        t.setLayoutParams(lpw(0, WRAP, 1f));
+        head.addView(t);
+        final TextView val = mono(c, value + unit, 12, ACC);
+        head.addView(val);
+        box.addView(head);
+        SeekBar s = new SeekBar(c);
+        s.setMax(max - min);
+        s.setProgress(Math.max(0, value - min));
+        s.setProgressTintList(ColorStateList.valueOf(ACC));
+        s.setThumbTintList(ColorStateList.valueOf(ACC));
+        s.setLayoutParams(lp(MATCH, WRAP));
+        s.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            public void onProgressChanged(SeekBar b, int p, boolean fromUser) { val.setText((min + p) + unit); }
+            public void onStartTrackingTouch(SeekBar b) { }
+            public void onStopTrackingTouch(SeekBar b) { cb.set(min + b.getProgress()); }
+        });
+        box.addView(s);
+        return box;
+    }
+
+    /** Two or three mutually exclusive options. */
+    public static LinearLayout seg(final Context c, final String[] labels, final int selected, final OnPick cb) {
+        final LinearLayout r = row(c);
+        r.setBackground(rr(c, SURF2, 12));
+        int pad = dp(c, 3);
+        r.setPadding(pad, pad, pad, pad);
+        for (int i = 0; i < labels.length; i++) {
+            final int index = i;
+            TextView t = tv(c, labels[i], 12.5f, i == selected ? ONACC : DIM, true);
+            t.setGravity(Gravity.CENTER);
+            t.setPadding(dp(c, 10), dp(c, 9), dp(c, 10), dp(c, 9));
+            t.setLayoutParams(lpw(0, WRAP, 1f));
+            if (i == selected) t.setBackground(rr(c, ACC, 10));
+            else t.setBackground(ripple(rr(c, 0x00000000, 10)));
+            t.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) { buzz(v); cb.set(index); }
+            });
+            r.addView(t);
+        }
+        return r;
+    }
+
+    /** Minus / value / plus. */
+    public static LinearLayout stepper(final Context c, final int start, final int min, final int max,
+                                       final int by, final String unit, final OnValue cb) {
+        final int[] value = { start };
+        final LinearLayout r = row(c);
+        final TextView val = tv(c, start + unit, 15, TXT, true);
+        val.setGravity(Gravity.CENTER);
+        val.setLayoutParams(lpw(0, WRAP, 1f));
+
+        ImageView minus = iconBtn(c, Ico.MINUS, TXT, 16, "less", null);
+        ImageView plus  = iconBtn(c, Ico.PLUS, TXT, 16, "more", null);
+        minus.setBackground(ripple(rrs(c, SURF2, LINE, 10, 1)));
+        plus.setBackground(ripple(rrs(c, SURF2, LINE, 10, 1)));
+        minus.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                value[0] = Math.max(min, value[0] - by);
+                val.setText(value[0] + unit);
+                buzz(v);
+                cb.set(value[0]);
+            }
+        });
+        plus.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                value[0] = Math.min(max, value[0] + by);
+                val.setText(value[0] + unit);
+                buzz(v);
+                cb.set(value[0]);
+            }
+        });
+        r.addView(minus);
+        r.addView(val);
+        r.addView(plus);
+        return r;
+    }
+
+    /** A tappable "label / value >" row used for pickers. */
+    public static LinearLayout field(Context c, String label, String value, int icoId, View.OnClickListener l) {
+        LinearLayout r = row(c);
+        r.setBackground(ripple(rrs(c, FIELD, LINE, 12, 1)));
+        r.setPadding(dp(c, 12), dp(c, 11), dp(c, 10), dp(c, 11));
+        margin(c, r, 0, 6, 0, 0);
+        r.setOnClickListener(l);
+        if (icoId > 0) {
+            r.addView(icon(c, icoId, DIM, 16));
+            r.addView(hgap(c, 10));
+        }
+        LinearLayout box = col(c);
+        box.setLayoutParams(lpw(0, WRAP, 1f));
+        box.addView(tv(c, label, 11, DIM, false));
+        TextView v = tv(c, value, 14.5f, TXT, false);
+        ellipsize(v);
+        box.addView(v);
+        r.addView(box);
+        r.addView(icon(c, Ico.RIGHT, DIM, 14));
+        return r;
     }
 }
 '@
@@ -832,15 +1323,16 @@ import android.graphics.RectF;
 import android.graphics.drawable.Drawable;
 
 /**
- * Every icon in the app is drawn here on a 24x24 grid, so the APK needs no
- * bitmap assets and no icon font.
+ * Every icon is drawn here on a 24x24 grid, so the apk needs no bitmap assets
+ * and no icon font.
  */
 public class Ico extends Drawable {
 
     public static final int PLAY = 1, PAUSE = 2, STOP = 3, NEXT = 4, PREV = 5, PLUS = 6,
             FOLDER = 7, TRASH = 8, SAVE = 9, OPEN = 10, HELP = 11, GEAR = 12, LOOP = 13,
             NOTE = 14, AB = 15, CHECK = 16, CLOSE = 17, UP = 18, DOWN = 19, CLOCK = 20,
-            LIST = 21, WAVE = 22, EDIT = 23, SCISSOR = 24;
+            LIST = 21, WAVE = 22, EDIT = 23, SCISSOR = 24, MORE = 25, BACK = 26, RIGHT = 27,
+            SEARCH = 28, COPY = 29, MINUS = 30, DRAG = 31, PROGRAM = 32, MOON = 33;
 
     private final int id;
     private int color;
@@ -897,11 +1389,13 @@ public class Ico extends Drawable {
                 line(cv, ox, oy, u, 12f, 5f, 12f, 19f);
                 line(cv, ox, oy, u, 5f, 12f, 19f, 12f);
                 break;
+            case MINUS:
+                line(cv, ox, oy, u, 5f, 12f, 19f, 12f);
+                break;
             case FOLDER:
                 poly(cv, ox, oy, u, true, 3f, 19f, 3f, 5.5f, 9f, 5.5f, 11f, 8.5f, 21f, 8.5f, 21f, 19f);
                 break;
             case TRASH:
-                p.setStyle(Paint.Style.STROKE);
                 box(cv, ox, oy, u, 6f, 7.5f, 18f, 20.5f, 2f);
                 line(cv, ox, oy, u, 3.5f, 7.5f, 20.5f, 7.5f);
                 poly(cv, ox, oy, u, false, 9f, 7.5f, 9f, 4f, 15f, 4f, 15f, 7.5f);
@@ -923,13 +1417,24 @@ public class Ico extends Drawable {
                 cv.drawText("?", ox + 12f * u, oy + 16.6f * u, p);
                 break;
             case GEAR: {
-                cv.drawCircle(ox + 12f * u, oy + 12f * u, 4.2f * u, p);
+                float cx = ox + 12f * u, cy = oy + 12f * u;
                 for (int i = 0; i < 8; i++) {
-                    double a = Math.PI * i / 4.0;
-                    float cxp = ox + 12f * u, cyp = oy + 12f * u;
-                    cv.drawLine(cxp + (float) Math.cos(a) * 6.6f * u, cyp + (float) Math.sin(a) * 6.6f * u,
-                                cxp + (float) Math.cos(a) * 9.4f * u, cyp + (float) Math.sin(a) * 9.4f * u, p);
+                    cv.save();
+                    cv.rotate(i * 45f, cx, cy);
+                    r.set(cx - 1.9f * u, cy - 11f * u, cx + 1.9f * u, cy - 6.4f * u);
+                    p.setStyle(Paint.Style.FILL);
+                    cv.drawRoundRect(r, 0.8f * u, 0.8f * u, p);
+                    cv.restore();
                 }
+                p.setStyle(Paint.Style.STROKE);
+                p.setStrokeWidth(2.6f * u);
+                cv.drawCircle(cx, cy, 6.4f * u, p);
+                p.setStrokeWidth(1.9f * u);
+                p.setColor(0x00000000);
+                p.setStyle(Paint.Style.FILL);
+                p.setColor(color);
+                p.setStyle(Paint.Style.STROKE);
+                cv.drawCircle(cx, cy, 3.1f * u, p);
                 break;
             }
             case LOOP:
@@ -963,6 +1468,12 @@ public class Ico extends Drawable {
             case DOWN:
                 poly(cv, ox, oy, u, false, 5.5f, 9f, 12f, 15.5f, 18.5f, 9f);
                 break;
+            case BACK:
+                poly(cv, ox, oy, u, false, 15f, 5f, 8f, 12f, 15f, 19f);
+                break;
+            case RIGHT:
+                poly(cv, ox, oy, u, false, 9.5f, 5f, 16.5f, 12f, 9.5f, 19f);
+                break;
             case CLOCK:
                 cv.drawCircle(ox + 12f * u, oy + 12f * u, 8.8f * u, p);
                 line(cv, ox, oy, u, 12f, 12f, 12f, 6.6f);
@@ -976,6 +1487,14 @@ public class Ico extends Drawable {
                     cv.drawCircle(ox + 4.5f * u, oy + y * u, 1.5f * u, p);
                     p.setStyle(Paint.Style.STROKE);
                 }
+                break;
+            case PROGRAM:
+                for (int i = 0; i < 3; i++) {
+                    float y = 6.5f + i * 5.5f;
+                    line(cv, ox, oy, u, 4f, y, 14f, y);
+                }
+                p.setStyle(Paint.Style.FILL);
+                poly(cv, ox, oy, u, true, 17f, 8f, 22f, 12f, 17f, 16f);
                 break;
             case WAVE: {
                 p.setStyle(Paint.Style.FILL);
@@ -994,6 +1513,38 @@ public class Ico extends Drawable {
                 line(cv, ox, oy, u, 18f, 4f, 6f, 18f);
                 cv.drawCircle(ox + 5.5f * u, oy + 19f * u, 2.6f * u, p);
                 cv.drawCircle(ox + 18.5f * u, oy + 19f * u, 2.6f * u, p);
+                break;
+            case MORE:
+                p.setStyle(Paint.Style.FILL);
+                for (int i = 0; i < 3; i++) cv.drawCircle(ox + 12f * u, oy + (5.5f + i * 6.5f) * u, 1.7f * u, p);
+                break;
+            case DRAG:
+                p.setStyle(Paint.Style.FILL);
+                for (int i = 0; i < 3; i++) {
+                    cv.drawCircle(ox + 9f * u, oy + (6f + i * 6f) * u, 1.5f * u, p);
+                    cv.drawCircle(ox + 15f * u, oy + (6f + i * 6f) * u, 1.5f * u, p);
+                }
+                break;
+            case SEARCH:
+                cv.drawCircle(ox + 10.5f * u, oy + 10.5f * u, 6.2f * u, p);
+                line(cv, ox, oy, u, 15.2f, 15.2f, 20f, 20f);
+                break;
+            case COPY:
+                box(cv, ox, oy, u, 8f, 8f, 20f, 20f, 2.4f);
+                poly(cv, ox, oy, u, false, 16f, 5f, 4.5f, 5f, 4.5f, 16f);
+                break;
+            case MOON:
+                path.reset();
+                path.moveTo(ox + 19f * u, oy + 15.5f * u);
+                path.cubicTo(ox + 13f * u, oy + 17.5f * u, ox + 7f * u, oy + 13f * u,
+                             ox + 9.5f * u, oy + 5.5f * u);
+                path.cubicTo(ox + 3f * u, oy + 8f * u, ox + 4f * u, oy + 20f * u,
+                             ox + 13f * u, oy + 20.5f * u);
+                path.cubicTo(ox + 16.5f * u, oy + 20.5f * u, ox + 18.5f * u, oy + 18f * u,
+                             ox + 19f * u, oy + 15.5f * u);
+                path.close();
+                p.setStyle(Paint.Style.FILL);
+                cv.drawPath(path, p);
                 break;
             default:
                 break;
@@ -1030,390 +1581,93 @@ public class Ico extends Drawable {
 '@
 
 # ---------------------------------------------------------------------------
-# Java: the script language
+# Java: in-app guide
 # ---------------------------------------------------------------------------
-Write-Src "$PKG_PATH\Parser.java" @'
-package com.riola.player;
-
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-
-/**
- * Turns the program text into a flat list of Cmd steps.
- * Everything is case insensitive; "#" and "//" start a comment.
- */
-public final class Parser {
-
-    public static class Result {
-        public final List<Cmd> cmds   = new ArrayList<Cmd>();
-        public final List<String> errors = new ArrayList<String>();
-        public boolean ok() { return errors.isEmpty(); }
-        public long estMs() {
-            long t = 0;
-            for (int i = 0; i < cmds.size(); i++) t += cmds.get(i).estMs();
-            return t;
-        }
-    }
-
-    private static class PErr extends Exception {
-        PErr(String m) { super(m); }
-    }
-
-    private static final int MAX_CMDS = 4000;
-
-    private Parser() { }
-
-    public static Result parse(String script, int trackCount) {
-        Result res = new Result();
-        if (script == null) script = "";
-        String[] lines = script.split("\n", -1);
-        List<int[]> stack = new ArrayList<int[]>();   // {startIndex, times, line}
-
-        for (int li = 0; li < lines.length; li++) {
-            int ln = li + 1;
-            String s = strip(lines[li]);
-            if (s.length() == 0) continue;
-            String[] t = s.split("\\s+");
-            String head = t[0].toUpperCase();
-            try {
-                if (head.equals("REPEAT")) {
-                    int n = pint(word(t, 1, "a repeat count"));
-                    if (n < 1) throw new PErr("REPEAT count must be 1 or more");
-                    if (stack.size() >= 8) throw new PErr("REPEAT blocks are nested too deep");
-                    stack.add(new int[]{ res.cmds.size(), n, ln });
-
-                } else if (head.equals("END") || head.equals("ENDREPEAT")) {
-                    if (stack.isEmpty()) throw new PErr("END without a matching REPEAT");
-                    int[] top = stack.remove(stack.size() - 1);
-                    int from = top[0], n = top[1];
-                    int count = res.cmds.size() - from;
-                    if (count == 0) throw new PErr("this REPEAT block is empty");
-                    for (int k = 1; k < n; k++) {
-                        for (int j = 0; j < count; j++) res.cmds.add(res.cmds.get(from + j).copy());
-                        if (res.cmds.size() > MAX_CMDS) throw new PErr("program is too long after expanding REPEAT");
-                    }
-
-                } else if (head.equals("PLAY") || head.equals("LOOP")) {
-                    Cmd c = new Cmd();
-                    c.type = Cmd.PLAY;
-                    c.line = ln;
-                    c.track = pint(word(t, 1, "a track number"));
-                    int i = repeatSpec(t, 2, c, head.equals("LOOP"));
-                    tail(t, i);
-                    res.cmds.add(c);
-
-                } else if (head.equals("SECTION") || head.equals("PART")) {
-                    Cmd c = new Cmd();
-                    c.type = Cmd.SECTION;
-                    c.line = ln;
-                    c.track = pint(word(t, 1, "a track number"));
-                    int i;
-                    String p1 = word(t, 2, "a start time such as 0:30");
-                    if (p1.indexOf('-') > 0) {
-                        String[] halves = p1.split("-", 2);
-                        c.a = pos(halves[0]);
-                        c.b = pos(halves[1]);
-                        i = 3;
-                    } else {
-                        c.a = pos(p1);
-                        c.b = pos(word(t, 3, "an end time such as 1:15"));
-                        i = 4;
-                    }
-                    if (c.b >= 0 && c.b <= c.a) throw new PErr("the end time must be after the start time");
-                    i = repeatSpec(t, i, c, false);
-                    tail(t, i);
-                    res.cmds.add(c);
-
-                } else if (head.equals("PAUSE") || head.equals("WAIT") || head.equals("SILENCE")) {
-                    Cmd c = new Cmd();
-                    c.type = Cmd.PAUSE;
-                    c.line = ln;
-                    long[] d = dur(t, 1);
-                    c.durMs = d[0];
-                    tail(t, 1 + (int) d[1]);
-                    res.cmds.add(c);
-
-                } else if (head.equals("VOLUME") || head.equals("VOL")) {
-                    Cmd c = new Cmd();
-                    c.type = Cmd.VOLUME;
-                    c.line = ln;
-                    c.value = pint(word(t, 1, "a volume from 0 to 100").replace("%", ""));
-                    if (c.value < 0 || c.value > 100) throw new PErr("volume must be between 0 and 100");
-                    tail(t, 2);
-                    res.cmds.add(c);
-
-                } else if (head.equals("SPEED")) {
-                    Cmd c = new Cmd();
-                    c.type = Cmd.SPEED;
-                    c.line = ln;
-                    String v = word(t, 1, "a speed such as 1.0 or 125%");
-                    c.value = v.endsWith("%") ? pint(v.substring(0, v.length() - 1))
-                                              : Math.round(pfloat(v) * 100f);
-                    if (c.value < 25 || c.value > 300) throw new PErr("speed must be between 0.25x and 3.0x");
-                    tail(t, 2);
-                    res.cmds.add(c);
-
-                } else if (head.equals("FADE")) {
-                    Cmd c = new Cmd();
-                    c.type = Cmd.FADE;
-                    c.line = ln;
-                    String v = word(t, 1, "a fade length in milliseconds");
-                    if (v.indexOf(':') >= 0 || hasUnit(v) || t.length > 2) {
-                        long[] d = dur(t, 1);
-                        c.value = (int) d[0];
-                        tail(t, 1 + (int) d[1]);
-                    } else {
-                        c.value = pint(v);
-                        tail(t, 2);
-                    }
-                    if (c.value < 0 || c.value > 5000) throw new PErr("fade must be between 0 and 5000 ms");
-                    res.cmds.add(c);
-
-                } else {
-                    throw new PErr("do not know the command '" + t[0] + "'");
-                }
-            } catch (PErr e) {
-                res.errors.add("Line " + ln + ": " + e.getMessage());
-            }
-        }
-
-        if (!stack.isEmpty()) {
-            res.errors.add("Line " + stack.get(stack.size() - 1)[2] + ": REPEAT is never closed with END");
-        }
-
-        Set<Integer> reported = new HashSet<Integer>();
-        for (int i = 0; i < res.cmds.size(); i++) {
-            Cmd c = res.cmds.get(i);
-            if (c.track < 0) continue;
-            if (c.track >= trackCount && reported.add(Integer.valueOf(c.line))) {
-                res.errors.add("Line " + c.line + ": there is no track " + c.track
-                        + " (the library holds " + trackCount + ")");
-            }
-        }
-        return res;
-    }
-
-    // ---- pieces ----------------------------------------------------------
-
-    /** Parses the optional "FOR <time>" / "<n> TIMES" suffix. Returns the next index. */
-    private static int repeatSpec(String[] t, int i, Cmd c, boolean loopRequired) throws PErr {
-        if (i >= t.length) {
-            if (loopRequired) throw new PErr("LOOP needs 'FOR <time>' or '<n> TIMES'");
-            c.times = 1;
-            return i;
-        }
-        String w = t[i].toUpperCase();
-        if (w.equals("FOR")) {
-            long[] d = dur(t, i + 1);
-            c.durMs = d[0];
-            c.times = -1;
-            if (c.durMs <= 0) throw new PErr("the duration must be longer than zero");
-            return i + 1 + (int) d[1];
-        }
-        if (w.equals("ONCE")) { c.times = 1; return i + 1; }
-        int[] n = timesSpec(t, i);
-        c.times = n[0];
-        if (c.times < 1) throw new PErr("the repeat count must be 1 or more");
-        return i + n[1];
-    }
-
-    private static int[] timesSpec(String[] t, int i) throws PErr {
-        String s = t[i].toUpperCase();
-        if (s.length() > 1 && s.charAt(0) == 'X') return new int[]{ pint(s.substring(1)), 1 };
-        if (s.length() > 1 && s.endsWith("X"))    return new int[]{ pint(s.substring(0, s.length() - 1)), 1 };
-        int n = pint(s);
-        if (i + 1 < t.length && t[i + 1].toUpperCase().startsWith("TIME")) return new int[]{ n, 2 };
-        return new int[]{ n, 1 };
-    }
-
-    private static void tail(String[] t, int i) throws PErr {
-        if (i < t.length) throw new PErr("did not expect '" + t[i] + "' at the end of the line");
-    }
-
-    private static String word(String[] t, int i, String what) throws PErr {
-        if (i >= t.length) throw new PErr("expected " + what);
-        return t[i];
-    }
-
-    private static String strip(String raw) {
-        String s = raw;
-        int h = s.indexOf('#');
-        if (h >= 0) s = s.substring(0, h);
-        int c = s.indexOf("//");
-        if (c >= 0) s = s.substring(0, c);
-        return s.trim();
-    }
-
-    private static boolean hasUnit(String s) {
-        String u = s.toUpperCase();
-        return u.endsWith("MS") || u.endsWith("S") || u.endsWith("SEC") || u.endsWith("SECS")
-                || u.endsWith("M") || u.endsWith("MIN") || u.endsWith("MINS")
-                || u.endsWith("H") || u.endsWith("HR");
-    }
-
-    private static long unitMs(String u) {
-        String s = u.toUpperCase();
-        if (s.equals("MS") || s.equals("MSEC")) return 1L;
-        if (s.equals("S") || s.equals("SEC") || s.equals("SECS") || s.equals("SECOND") || s.equals("SECONDS")) return 1000L;
-        if (s.equals("M") || s.equals("MIN") || s.equals("MINS") || s.equals("MINUTE") || s.equals("MINUTES")) return 60000L;
-        if (s.equals("H") || s.equals("HR") || s.equals("HRS") || s.equals("HOUR") || s.equals("HOURS")) return 3600000L;
-        return 0L;
-    }
-
-    /** Returns {milliseconds, tokensUsed}. */
-    private static long[] dur(String[] t, int i) throws PErr {
-        if (i >= t.length) throw new PErr("expected a length such as '5 MIN', '90 SEC' or '2:30'");
-        String s = t[i];
-        if (s.indexOf(':') >= 0) return new long[]{ clock(s), 1 };
-
-        int split = 0;
-        while (split < s.length() && (Character.isDigit(s.charAt(split)) || s.charAt(split) == '.')) split++;
-        if (split == 0) throw new PErr("'" + s + "' is not a length");
-        String num = s.substring(0, split);
-        String unit = s.substring(split);
-        if (unit.length() > 0) {
-            long m = unitMs(unit);
-            if (m == 0) throw new PErr("'" + unit + "' is not a time unit (use MS, SEC, MIN or HOUR)");
-            return new long[]{ (long) (pfloat(num) * m), 1 };
-        }
-        if (i + 1 < t.length) {
-            long m = unitMs(t[i + 1]);
-            if (m > 0) return new long[]{ (long) (pfloat(num) * m), 2 };
-        }
-        throw new PErr("add a unit after " + num + " (MS, SEC, MIN or HOUR)");
-    }
-
-    /** A position inside a track: 0:30, 1:02:05, 45 (seconds), 45s, or END. */
-    private static long pos(String s) throws PErr {
-        String u = s.toUpperCase();
-        if (u.equals("END") || u.equals("*")) return -1L;
-        if (s.indexOf(':') >= 0) return clock(s);
-        int split = 0;
-        while (split < s.length() && (Character.isDigit(s.charAt(split)) || s.charAt(split) == '.')) split++;
-        if (split == 0) throw new PErr("'" + s + "' is not a time position");
-        String num = s.substring(0, split);
-        String unit = s.substring(split);
-        long mult = unit.length() == 0 ? 1000L : unitMs(unit);
-        if (mult == 0) throw new PErr("'" + unit + "' is not a time unit");
-        return (long) (pfloat(num) * mult);
-    }
-
-    private static long clock(String s) throws PErr {
-        String[] parts = s.split(":");
-        if (parts.length < 2 || parts.length > 3) throw new PErr("'" + s + "' is not a mm:ss time");
-        try {
-            if (parts.length == 2) {
-                long m = Long.parseLong(parts[0].trim());
-                float sec = Float.parseFloat(parts[1].trim());
-                return m * 60000L + (long) (sec * 1000f);
-            }
-            long h = Long.parseLong(parts[0].trim());
-            long m = Long.parseLong(parts[1].trim());
-            float sec = Float.parseFloat(parts[2].trim());
-            return h * 3600000L + m * 60000L + (long) (sec * 1000f);
-        } catch (NumberFormatException e) {
-            throw new PErr("'" + s + "' is not a mm:ss time");
-        }
-    }
-
-    private static int pint(String s) throws PErr {
-        try { return Integer.parseInt(s.trim()); }
-        catch (NumberFormatException e) { throw new PErr("'" + s + "' is not a whole number"); }
-    }
-
-    private static float pfloat(String s) throws PErr {
-        try { return Float.parseFloat(s.trim()); }
-        catch (NumberFormatException e) { throw new PErr("'" + s + "' is not a number"); }
-    }
-}
-'@
-
 Write-Src "$PKG_PATH\HelpText.java" @'
 package com.riola.player;
 
-/** The in-app script reference. */
+/** The in-app guide. Plain ASCII, shown in a scrolling dialog. */
 public final class HelpText {
 
     private HelpText() { }
 
     public static final String TEXT =
-        "RIOLA PROGRAM LANGUAGE\n" +
-        "======================\n" +
+        "HOW RIOLA WORKS\n" +
+        "===============\n" +
         "\n" +
-        "A program is one command per line, run from top to bottom.\n" +
-        "Tracks are addressed by the number shown next to them in the\n" +
-        "library ([0], [1], [2] ...). Commands are case insensitive.\n" +
+        "A program is a list of steps that Riola plays from top to\n" +
+        "bottom. Build one by tapping Add step; there is nothing to\n" +
+        "type and nothing to memorise.\n" +
         "\n" +
-        "PLAY\n" +
-        "----\n" +
-        "  PLAY 0                 play track 0 once, start to finish\n" +
-        "  PLAY 0 3 TIMES         play it three times\n" +
-        "  PLAY 0 x3              same thing, shorter\n" +
-        "  PLAY 0 FOR 20 MIN      keep replaying it for twenty minutes\n" +
-        "  LOOP 0 FOR 20 MIN      identical to the line above\n" +
+        "1. TRACKS\n" +
+        "---------\n" +
+        "Open Tracks and add files, or point Riola at a whole folder.\n" +
+        "Riola only reads them - your files are never moved, copied or\n" +
+        "changed. Tap a track to hear it. The little AB button opens\n" +
+        "the section picker.\n" +
         "\n" +
-        "SECTION (A-B repeat)\n" +
-        "--------------------\n" +
-        "  SECTION 1 0:30 1:15              play 0:30 - 1:15 once\n" +
-        "  SECTION 1 0:30 1:15 8 TIMES      loop that part eight times\n" +
-        "  SECTION 1 0:30 1:15 FOR 12 MIN   loop it for twelve minutes\n" +
-        "  SECTION 1 0:30-1:15 x8           dash form, same as above\n" +
-        "  SECTION 1 2:00 END               from 2:00 to the end\n" +
-        "\n" +
-        "SILENCE\n" +
-        "-------\n" +
-        "  PAUSE 5 MIN            five minutes of silence\n" +
-        "  PAUSE 90 SEC           ninety seconds\n" +
-        "  PAUSE 2:30             two and a half minutes\n" +
-        "  WAIT 45 SEC            WAIT and SILENCE mean PAUSE\n" +
-        "\n" +
-        "REPEAT BLOCKS\n" +
-        "-------------\n" +
-        "  REPEAT 4               run everything up to END four times\n" +
-        "    SECTION 0 0:10 0:40 x2\n" +
-        "    PAUSE 30 SEC\n" +
-        "  END\n" +
-        "  Blocks can be nested up to eight deep.\n" +
-        "\n" +
-        "TUNING (applies to the steps that follow)\n" +
-        "-----------------------------------------\n" +
-        "  VOLUME 70              70% of the master volume\n" +
-        "  SPEED 1.25             play 25% faster (pitch corrected)\n" +
-        "  FADE 200               200 ms fade at every loop edge\n" +
-        "\n" +
-        "TIME FORMATS\n" +
-        "------------\n" +
-        "  Lengths : 90 SEC, 5 MIN, 1.5 MIN, 2:30, 500 MS, 1 HOUR\n" +
-        "  Points  : 0:30, 1:02:05, 45 (bare numbers mean seconds), END\n" +
-        "\n" +
-        "COMMENTS\n" +
+        "2. STEPS\n" +
         "--------\n" +
-        "  # everything after a hash is ignored\n" +
-        "  // so is everything after a double slash\n" +
+        "There are three kinds of step.\n" +
         "\n" +
-        "EXAMPLE: A PRACTICE SESSION\n" +
-        "---------------------------\n" +
-        "  # warm up with the full piece\n" +
-        "  PLAY 0\n" +
-        "  PAUSE 1 MIN\n" +
+        "  Whole track   plays a track from start to finish.\n" +
+        "  Section       plays one slice of a track, from A to B.\n" +
+        "  Silence       plays nothing for a while.\n" +
         "\n" +
-        "  # drill the hard bar, slowly, then at tempo\n" +
-        "  SPEED 0.8\n" +
-        "  SECTION 0 1:12 1:28 FOR 10 MIN\n" +
-        "  SPEED 1.0\n" +
-        "  SECTION 0 1:12 1:28 x10\n" +
+        "Every playing step repeats in one of two ways:\n" +
         "\n" +
-        "  PAUSE 5 MIN\n" +
-        "  PLAY 0 2 TIMES\n" +
+        "  a number of times  -  play it 8 times, then move on.\n" +
+        "  for a length       -  keep looping it for 12 minutes.\n" +
         "\n" +
-        "TIPS\n" +
-        "----\n" +
-        "  - Tap the A-B button on a track to pick section times by ear.\n" +
-        "  - Tap any step in the step list to jump straight to it.\n" +
-        "  - Playback keeps running in the background; use the\n" +
-        "    notification to pause, skip or stop.\n";
+        "Each step can also have:\n" +
+        "\n" +
+        "  Gap      a rest between one repeat and the next.\n" +
+        "  Speed    slower or faster, without changing the pitch.\n" +
+        "  Volume   quieter or louder than the other steps.\n" +
+        "  Off      keep the step but skip it for now.\n" +
+        "\n" +
+        "3. SECTIONS BY EAR\n" +
+        "------------------\n" +
+        "In a section step, tap Pick by ear. Play the track, tap Set A\n" +
+        "where the slice should start and Set B where it should end.\n" +
+        "The 1s and 5s buttons nudge each mark. Turn on Loop A-B to\n" +
+        "hear the slice on repeat while you fine tune it.\n" +
+        "\n" +
+        "4. RUNNING\n" +
+        "----------\n" +
+        "Press the play button next to a program on the home screen,\n" +
+        "or Run inside the editor. While a program runs you can:\n" +
+        "\n" +
+        "  - pause and resume\n" +
+        "  - jump to the previous or next step\n" +
+        "  - tap any step in the list to jump straight to it\n" +
+        "  - drag the progress bar to move inside the current track\n" +
+        "\n" +
+        "Playback continues when you leave the app or lock the phone.\n" +
+        "The notification and the lock screen carry the same controls.\n" +
+        "\n" +
+        "5. REPEATING THE WHOLE PROGRAM\n" +
+        "------------------------------\n" +
+        "In the editor, Repeat program says how many times the whole\n" +
+        "list runs. Set it to forever for an endless session.\n" +
+        "\n" +
+        "6. SETTINGS WORTH KNOWING\n" +
+        "-------------------------\n" +
+        "  Count in        a few seconds of silence before step one,\n" +
+        "                  handy if you need to pick up an instrument.\n" +
+        "  Stop after      a sleep timer: end everything after N minutes.\n" +
+        "  Fade at edges   softens the jump when a loop restarts.\n" +
+        "  Keep awake      holds the CPU on so long silences stay exact.\n" +
+        "  Pause for calls and for unplugged headphones are on by default.\n" +
+        "\n" +
+        "GOOD TO KNOW\n" +
+        "------------\n" +
+        "  - Steps remember the track itself, so reordering or renaming\n" +
+        "    tracks never breaks a program.\n" +
+        "  - Remove a track that a program uses and the step is marked\n" +
+        "    missing; it is skipped instead of stopping the run.\n" +
+        "  - Everything is stored on the phone. Riola has no network\n" +
+        "    permission at all.\n";
 }
 '@
 
@@ -1438,23 +1692,25 @@ import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Runs a program on a worker thread with a single MediaPlayer.
- *
- * One instance per process (Engine.get) so the activity and the foreground
- * service always look at the same playback.
+ * One instance per process, so the screens and the foreground service always
+ * look at the same playback.
  */
 public class Engine {
 
     /** Snapshot of what the engine is doing; read by the UI and the notification. */
     public static class St {
-        public boolean running, paused, preview;
+        public boolean running, paused, preview, resting;
+        public String programId = "", programName = "";
         public int  step, steps;
-        public String stepText = "";
-        public String trackTitle = "";
+        public String stepTitle = "", stepDetail = "";
         public int  posMs, durMs;
         public long stepRemainMs = -1;   // -1 = not time limited
         public long progRemainMs = -1;
         public int  repDone;
         public int  repTotal = -1;       // -1 = not count limited
+        public int  loopDone;
+        public int  loopTotal = 1;       // -1 = forever
+        public int  countIn = -1;        // seconds left before the first step
     }
 
     public interface Listener {
@@ -1480,20 +1736,23 @@ public class Engine {
     public final St st = new St();
 
     private MediaPlayer mp;
-    private int loaded = -1;
+    private String loadedUri = "";
     private Thread worker;
-    private List<Cmd> cmds = new ArrayList<Cmd>();
+    private final List<Step> steps = new ArrayList<Step>();
+    private int loops = 1;
 
     private volatile boolean stopReq, paused, running, completed, pushPending;
-    private volatile int skip;        // -1 previous step, +1 next step, 2 jump
+    private volatile int skip;          // -1 previous step, +1 next step, 2 jump
     private volatile int jump = -1;
     private volatile int idx;
-    private volatile int gen;         // run id, so a restart cannot fire the old "finished"
+    private volatile int gen;           // run id, so a restart cannot fire the old "finished"
     private volatile float duck = 1f;
-    private volatile float gain = 1f;  // fade envelope
-    private volatile float vol = 1f;
-    private volatile float speed = 1f;
+    private volatile float gain = 1f;   // fade envelope
+    private volatile float vol = 1f;    // master volume
+    private volatile float speed = 1f;  // master speed
+    private volatile float stepVol = 1f, stepSpeed = 1f;
     private volatile long fadeMs = 150;
+    private volatile long deadline = -1;
 
     private Engine(Context c) {
         ctx = c;
@@ -1506,33 +1765,52 @@ public class Engine {
 
     public boolean isRunning() { return running; }
     public boolean isPaused()  { return paused; }
-    public int stepCount()     { return cmds.size(); }
-    public String logText()    { synchronized (logBuf) { return logBuf.toString(); } }
-    public void clearLog()     { synchronized (logBuf) { logBuf.setLength(0); } }
+    public String  logText()   { synchronized (logBuf) { return logBuf.toString(); } }
+    public void    clearLog()  { synchronized (logBuf) { logBuf.setLength(0); } }
 
-    // ---- control ---------------------------------------------------------
-    public void start(List<Cmd> program, int from) { begin(program, from, false); }
-
-    public void preview(int track) {
-        Cmd c = new Cmd();
-        c.type = Cmd.PLAY;
-        c.track = track;
-        c.times = 1;
-        List<Cmd> one = new ArrayList<Cmd>();
-        one.add(c);
-        begin(one, 0, true);
+    /** True when this exact program is the one playing. */
+    public boolean isPlaying(Program p) {
+        return running && p != null && p.id.equals(st.programId);
     }
 
-    private void begin(List<Cmd> program, int from, boolean preview) {
+    // ---- control ---------------------------------------------------------
+    public void start(Program p, int fromStep) {
+        if (p == null) return;
+        if (p.enabledCount() == 0) {
+            log("nothing to play - every step is switched off");
+            return;
+        }
         stop();
-        cmds = new ArrayList<Cmd>(program);
-        if (cmds.isEmpty()) return;
+        steps.clear();
+        for (int i = 0; i < p.steps.size(); i++) steps.add(p.steps.get(i).copy());
+        loops = p.loops;
+        st.programId = p.id;
+        st.programName = p.name;
+        st.preview = false;
+        begin(Math.max(0, Math.min(fromStep, steps.size() - 1)));
+    }
+
+    public void previewTrack(Track t) {
+        if (t == null) return;
+        stop();
+        steps.clear();
+        steps.add(Step.play(t));
+        loops = 1;
+        st.programId = "";
+        st.programName = "Preview";
+        st.preview = true;
+        begin(0);
+    }
+
+    private void begin(int from) {
         vol = prefs.volume() / 100f;
         speed = prefs.speed();
         fadeMs = prefs.fadeMs();
         duck = 1f;
         gain = 1f;
-        idx = Math.max(0, Math.min(from, cmds.size() - 1));
+        stepVol = 1f;
+        stepSpeed = 1f;
+        idx = from;
         stopReq = false;
         paused = false;
         skip = 0;
@@ -1540,9 +1818,13 @@ public class Engine {
         running = true;
         st.running = true;
         st.paused = false;
-        st.preview = preview;
-        st.steps = cmds.size();
+        st.steps = steps.size();
         st.step = idx;
+        st.loopDone = 0;
+        st.loopTotal = loops;
+        st.countIn = -1;
+        int stopMin = st.preview ? 0 : prefs.autoStopMin();
+        deadline = stopMin > 0 ? SystemClock.elapsedRealtime() + stopMin * 60000L : -1;
         final int myGen = ++gen;
         Thread t = new Thread(new Runnable() { public void run() { loop(myGen); } }, "riola-engine");
         t.setPriority(Thread.NORM_PRIORITY + 1);
@@ -1563,11 +1845,13 @@ public class Engine {
         releasePlayer();
         st.running = false;
         st.paused = false;
+        st.resting = false;
         st.posMs = 0;
         st.durMs = 0;
         st.stepRemainMs = -1;
         st.progRemainMs = -1;
         st.repTotal = -1;
+        st.countIn = -1;
         push();
     }
 
@@ -1592,7 +1876,7 @@ public class Engine {
     public void prev()        { if (running) { skip = -1; wake(); } }
 
     public void jumpTo(int i) {
-        if (running && i >= 0 && i < cmds.size()) { jump = i; skip = 2; wake(); }
+        if (running && i >= 0 && i < steps.size()) { jump = i; skip = 2; wake(); }
     }
 
     public void seekTo(int ms) {
@@ -1602,39 +1886,60 @@ public class Engine {
     }
 
     public void setDuck(float d) { duck = d; applyVol(); }
-
-    /** Live volume change from the settings sheet. */
     public void setMasterVolume(int percent) { vol = percent / 100f; applyVol(); }
-
-    public void setMasterSpeed(int percent) { speed = percent / 100f; applySpeed(); }
+    public void setMasterSpeed(int percent)  { speed = percent / 100f; applySpeed(); }
 
     // ---- worker ----------------------------------------------------------
     private void loop(final int myGen) {
-        log("program started, " + cmds.size() + " step(s)");
+        log("started: " + st.programName);
+        countIn();
+
+        int pass = 0;
+        int playedThisPass = 0;
         while (!stopReq) {
+            if (expired()) break;
+            if (idx >= steps.size()) {
+                pass++;
+                if (playedThisPass == 0) break;                 // nothing runnable, do not spin
+                if (loops >= 0 && pass >= Math.max(1, loops)) break;
+                idx = 0;
+                playedThisPass = 0;
+                st.loopDone = pass;
+                log("loop " + (pass + 1) + (loops < 0 ? "" : " of " + loops));
+                continue;
+            }
             if (idx < 0) idx = 0;
-            if (idx >= cmds.size()) break;
-            Cmd c = cmds.get(idx);
+            Step s = steps.get(idx);
+            if (!s.enabled) { idx++; continue; }
 
+            playedThisPass++;
             st.step = idx;
-            st.steps = cmds.size();
-            st.stepText = c.label();
-            st.trackTitle = (c.type == Cmd.PAUSE) ? "Silence" : c.trackTitle();
+            st.steps = steps.size();
+            st.stepTitle = s.title();
+            st.stepDetail = s.detail();
             st.repDone = 0;
-            st.repTotal = c.times > 0 ? c.times : -1;
-            st.stepRemainMs = c.durMs > 0 ? c.durMs : -1;
-            st.progRemainMs = restEst(idx + 1) + c.estMs();
+            st.repTotal = s.timed() ? -1 : Math.max(1, s.times);
+            st.stepRemainMs = s.timed() ? s.durMs : -1;
+            st.resting = s.type == Step.SILENCE;
+            stepVol = Math.max(0f, s.volumePct / 100f);
+            stepSpeed = Math.max(0.25f, s.speedPct / 100f);
             push();
-            log("[" + (idx + 1) + "/" + cmds.size() + "] " + c.label());
+            log("step " + (idx + 1) + "/" + steps.size() + ": " + s.title() + " - " + s.detail());
 
-            exec(c, restEst(idx + 1));
+            long rest = restEst(idx + 1);
+            if (s.type == Step.SILENCE) {
+                pausePlayer();
+                silence(s.durMs, rest, true);
+            } else {
+                segment(s, rest);
+            }
 
-            int s = skip;
+            int sk = skip;
             skip = 0;
             if (stopReq) break;
-            if (s == 2)       { idx = jump; jump = -1; }
-            else if (s == -1) { idx = idx - 1; }
-            else              { idx = idx + 1; }
+            if (sk == 2)       { idx = jump; jump = -1; }
+            else if (sk == -1) { idx = idx - 1; }
+            else               { idx = idx + 1; }
         }
 
         boolean finished = !stopReq;
@@ -1643,103 +1948,111 @@ public class Engine {
         running = false;
         st.running = false;
         st.paused = false;
+        st.resting = false;
         st.posMs = 0;
         st.durMs = 0;
         st.stepRemainMs = -1;
         st.progRemainMs = -1;
-        st.stepText = finished ? "Program finished" : "Stopped";
-        log(finished ? "program finished" : "program stopped");
+        st.countIn = -1;
+        st.stepTitle = finished ? "Finished" : "Stopped";
+        st.stepDetail = "";
+        log(finished ? "finished" : "stopped");
         push();
         final boolean done = finished;
         main.post(new Runnable() {
             public void run() {
-                if (myGen != gen) return;      // a new program already took over
+                if (myGen != gen) return;      // a new run already took over
                 for (Listener l : listeners) l.onFinished(done);
             }
         });
     }
 
+    private boolean expired() {
+        if (deadline > 0 && SystemClock.elapsedRealtime() >= deadline) {
+            log("stop timer reached");
+            stopReq = true;
+            return true;
+        }
+        return false;
+    }
+
+    private void countIn() {
+        int secs = st.preview ? 0 : prefs.countIn();
+        if (secs <= 0) return;
+        log("starting in " + secs + "s");
+        for (int i = secs; i > 0 && !stopReq && skip == 0; i--) {
+            st.countIn = i;
+            st.stepTitle = "Starting in " + i;
+            st.stepDetail = "get ready";
+            push();
+            waitLock(1000);
+        }
+        st.countIn = -1;
+    }
+
     private long restEst(int from) {
         long t = 0;
-        for (int i = from; i < cmds.size(); i++) t += cmds.get(i).estMs();
+        for (int i = from; i < steps.size(); i++) t += steps.get(i).estMs();
         return t;
     }
 
-    private void exec(Cmd c, long rest) {
-        switch (c.type) {
-            case Cmd.VOLUME:
-                vol = c.value / 100f;
-                applyVol();
-                return;
-            case Cmd.SPEED:
-                speed = c.value / 100f;
-                applySpeed();
-                return;
-            case Cmd.FADE:
-                fadeMs = c.value;
-                return;
-            case Cmd.PAUSE:
-                pausePlayer();
-                silence(c.durMs, rest);
-                return;
-            default:
-                segment(c, rest);
-        }
-    }
-
-    /** A stretch of silence that still responds to pause / skip / stop. */
-    private void silence(long total, long rest) {
+    /** Silence that still answers pause / skip / stop. */
+    private void silence(long total, long rest, boolean showProgress) {
         long remain = total;
         long last = SystemClock.elapsedRealtime();
         while (remain > 0) {
-            if (stopReq || skip != 0) return;
+            if (stopReq || skip != 0 || expired()) return;
             waitLock(200);
             long now = SystemClock.elapsedRealtime();
             long d = now - last;
             last = now;
             if (!paused) remain -= d;
-            st.posMs = (int) Math.min(Integer.MAX_VALUE, total - remain);
-            st.durMs = (int) Math.min(Integer.MAX_VALUE, total);
-            st.stepRemainMs = Math.max(0, remain);
-            st.progRemainMs = rest + Math.max(0, remain);
-            push();
+            if (showProgress) {
+                st.posMs = (int) Math.min(Integer.MAX_VALUE, total - remain);
+                st.durMs = (int) Math.min(Integer.MAX_VALUE, total);
+                st.stepRemainMs = Math.max(0, remain);
+                st.progRemainMs = rest + Math.max(0, remain);
+                push();
+            }
         }
     }
 
-    /** PLAY / SECTION: one region, repeated a number of times or for a while. */
-    private void segment(Cmd c, long rest) {
-        List<Track> lib = Store.LIB;
-        if (c.track < 0 || c.track >= lib.size()) {
-            log("  ! track " + c.track + " is not in the library - step skipped");
+    /** A whole track or an A-B slice, repeated a number of times or for a while. */
+    private void segment(Step step, long rest) {
+        Track track = step.track();
+        if (track == null) {
+            log("  ! that track is not in the library any more - skipped");
+            waitLock(400);
             return;
         }
-        Track track = lib.get(c.track);
-        if (!open(c.track, track)) return;
+        if (!open(track)) return;
 
         long dur = duration();
         boolean known = dur > 0;
-        long end = (c.b < 0 || (known && c.b > dur)) ? (known ? dur : Long.MAX_VALUE / 4) : c.b;
-        long start = Math.max(0, c.a);
+        long end;
+        if (step.type == Step.SECTION && step.b > 0) end = known ? Math.min(step.b, dur) : step.b;
+        else end = known ? dur : Long.MAX_VALUE / 4;
+        long start = step.type == Step.SECTION ? Math.max(0, step.a) : 0;
         if (known && start >= end - 150) {
-            log("  ! that section is outside the track - step skipped");
+            log("  ! that section falls outside the track - skipped");
             return;
         }
 
-        long budget = c.durMs > 0 ? c.durMs : -1;
+        long budget = step.timed() ? step.durMs : -1;
         long remain = budget;
         long fade = Math.min(fadeMs, Math.max(0, (end - start) / 4));
         int rep = 0;
 
+        applySpeed();
         startAt(start);
         long grace = SystemClock.elapsedRealtime() + 400;
         long last = SystemClock.elapsedRealtime();
 
         while (true) {
-            if (stopReq || skip != 0) { pausePlayer(); setGain(1f); return; }
+            if (stopReq || skip != 0 || expired()) { pausePlayer(); setGain(1f); return; }
 
             int pos = position();
-            long toEnd = end - pos;
-            waitLock(toEnd < 500 ? 20 : 120);
+            waitLock(end - pos < 500 ? 20 : 120);
 
             long now = SystemClock.elapsedRealtime();
             long d = now - last;
@@ -1753,12 +2066,14 @@ public class Engine {
                 if (remain <= 0) {
                     fadeOut(160);
                     pausePlayer();
-                    log("  time is up after " + (rep + 1) + " pass(es)");
                     setGain(1f);
+                    log("  time is up after " + (rep + 1) + " pass(es)");
                     return;
                 }
             } else {
-                st.progRemainMs = rest + Math.max(0, (long) (end - position()) + (long) (end - start) * Math.max(0, c.times - 1 - rep));
+                long left = Math.max(0, end - position());
+                long more = Math.max(0, (long) (Math.max(1, step.times) - 1 - rep)) * (end - start);
+                st.progRemainMs = rest + left + more;
             }
 
             pos = position();
@@ -1766,7 +2081,6 @@ public class Engine {
             st.durMs = known ? (int) dur : pos;
             st.repDone = rep;
 
-            // fade envelope at both edges of the region
             if (fade > 0) {
                 float g = 1f;
                 long since = pos - start;
@@ -1783,13 +2097,24 @@ public class Engine {
             completed = false;
             rep++;
             st.repDone = rep;
-            if (c.times > 0 && rep >= c.times) {
+            if (!step.timed() && rep >= Math.max(1, step.times)) {
                 pausePlayer();
                 setGain(1f);
                 log("  played " + rep + " time(s)");
                 return;
             }
             if (budget > 0 && remain <= 0) { pausePlayer(); setGain(1f); return; }
+
+            if (step.gapMs > 0) {
+                pausePlayer();
+                setGain(1f);
+                st.resting = true;
+                push();
+                silence(step.gapMs, rest, false);
+                st.resting = false;
+                if (stopReq || skip != 0) return;
+                last = SystemClock.elapsedRealtime();
+            }
             setGain(fade > 0 ? 0.02f : 1f);
             startAt(start);
             grace = SystemClock.elapsedRealtime() + 400;
@@ -1798,9 +2123,9 @@ public class Engine {
     }
 
     // ---- MediaPlayer plumbing -------------------------------------------
-    private boolean open(int index, Track t) {
+    private boolean open(Track t) {
         MediaPlayer m = mp;
-        if (m != null && loaded == index) {
+        if (m != null && loadedUri.equals(t.uri)) {
             try { if (m.isPlaying()) m.pause(); } catch (IllegalStateException e) { /* ignore */ }
             return true;
         }
@@ -1826,14 +2151,14 @@ public class Engine {
             m.setDataSource(ctx, t.toUri());
             m.prepare();
             mp = m;
-            loaded = index;
+            loadedUri = t.uri;
             applyVol();
             return true;
         } catch (Exception e) {
             log("  ! cannot open " + t.shortTitle() + " (" + e.getClass().getSimpleName() + ")");
             try { if (m != null) m.release(); } catch (Exception ignored) { }
             mp = null;
-            loaded = -1;
+            loadedUri = "";
             return false;
         }
     }
@@ -1874,7 +2199,7 @@ public class Engine {
     private void releasePlayer() {
         MediaPlayer m = mp;
         mp = null;
-        loaded = -1;
+        loadedUri = "";
         if (m == null) return;
         try { m.reset(); } catch (Exception e) { /* ignore */ }
         try { m.release(); } catch (Exception e) { /* ignore */ }
@@ -1892,15 +2217,12 @@ public class Engine {
         try { return Math.max(0, m.getDuration()); } catch (IllegalStateException e) { return 0; }
     }
 
-    private void setGain(float g) {
-        gain = g;
-        applyVol();
-    }
+    private void setGain(float g) { gain = g; applyVol(); }
 
     private void applyVol() {
         MediaPlayer m = mp;
         if (m == null) return;
-        float v = vol * duck * gain;
+        float v = vol * stepVol * duck * gain;
         if (v < 0f) v = 0f;
         if (v > 1f) v = 1f;
         try { m.setVolume(v, v); } catch (IllegalStateException e) { /* ignore */ }
@@ -1911,10 +2233,13 @@ public class Engine {
         if (m == null) return;
         try {
             if (!m.isPlaying()) return;
+            float f = speed * stepSpeed;
+            if (f < 0.25f) f = 0.25f;
+            if (f > 3f) f = 3f;
             PlaybackParams pp = m.getPlaybackParams();
-            pp.setSpeed(speed <= 0f ? 1f : speed);
+            pp.setSpeed(f);
             m.setPlaybackParams(pp);
-        } catch (Exception e) { /* device refused the speed change */ }
+        } catch (Exception e) { /* the device refused the speed change */ }
     }
 
     // ---- helpers ---------------------------------------------------------
@@ -2027,12 +2352,12 @@ public class PlayerService extends Service implements Engine.Listener {
 
         session = new MediaSession(this, "Riola");
         session.setCallback(new MediaSession.Callback() {
-            @Override public void onPlay()             { engine.setPaused(false); }
-            @Override public void onPause()            { engine.setPaused(true); }
-            @Override public void onStop()             { engine.stop(); shutdown(); }
-            @Override public void onSkipToNext()       { engine.next(); }
-            @Override public void onSkipToPrevious()   { engine.prev(); }
-            @Override public void onSeekTo(long p)     { engine.seekTo((int) p); }
+            @Override public void onPlay()           { engine.setPaused(false); }
+            @Override public void onPause()          { engine.setPaused(true); }
+            @Override public void onStop()           { engine.stop(); shutdown(); }
+            @Override public void onSkipToNext()     { engine.next(); }
+            @Override public void onSkipToPrevious() { engine.prev(); }
+            @Override public void onSeekTo(long p)   { engine.seekTo((int) p); }
         });
         session.setActive(true);
 
@@ -2084,21 +2409,10 @@ public class PlayerService extends Service implements Engine.Listener {
         super.onDestroy();
     }
 
-    @Override
-    public void onTaskRemoved(Intent rootIntent) {
-        // A swipe of the task must not kill the audio: nothing to do here,
-        // the foreground notification keeps the service alive.
-        super.onTaskRemoved(rootIntent);
-    }
-
     // ---- engine callbacks ------------------------------------------------
     @Override public void onState(Engine.St s) { post(false); }
     @Override public void onLog(String line) { }
-
-    @Override
-    public void onFinished(boolean completed) {
-        shutdown();
-    }
+    @Override public void onFinished(boolean completed) { shutdown(); }
 
     private void shutdown() {
         holdWakeLock(false);
@@ -2112,7 +2426,7 @@ public class PlayerService extends Service implements Engine.Listener {
     private void post(boolean force) {
         if (!started) return;
         Engine.St s = engine.st;
-        String key = s.trackTitle + "|" + s.stepText + "|" + s.paused + "|" + s.running + "|" + s.step;
+        String key = s.stepTitle + "|" + s.stepDetail + "|" + s.paused + "|" + s.running + "|" + s.step;
         long now = SystemClock.elapsedRealtime();
         if (!force && key.equals(lastKey) && now - lastPost < 1000) return;
         lastKey = key;
@@ -2131,15 +2445,24 @@ public class PlayerService extends Service implements Engine.Listener {
         PendingIntent content = PendingIntent.getActivity(this, 0, open,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
-        String sub = s.running ? ("Step " + (s.step + 1) + " of " + s.steps) : "Idle";
-        if (s.running && s.stepRemainMs >= 0) sub = sub + "  -  " + Fmt.human(s.stepRemainMs) + " left";
-        else if (s.running && s.repTotal > 0) sub = sub + "  -  pass " + Math.min(s.repDone + 1, s.repTotal) + " of " + s.repTotal;
+        StringBuilder sub = new StringBuilder();
+        if (s.running) {
+            sub.append(s.programName == null || s.programName.length() == 0 ? "Riola" : s.programName);
+            if (!s.preview) sub.append("  .  step ").append(s.step + 1).append(" of ").append(s.steps);
+            if (s.loopTotal < 0) sub.append("  .  loop ").append(s.loopDone + 1);
+            else if (s.loopTotal > 1) sub.append("  .  loop ").append(s.loopDone + 1).append(" of ").append(s.loopTotal);
+            if (s.stepRemainMs >= 0) sub.append("  .  ").append(Fmt.human(s.stepRemainMs)).append(" left");
+            else if (s.repTotal > 1) sub.append("  .  pass ").append(Math.min(s.repDone + 1, s.repTotal))
+                                        .append(" of ").append(s.repTotal);
+        } else {
+            sub.append("Idle");
+        }
 
         Notification.Builder b = new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(R.drawable.ic_note)
-                .setContentTitle(s.trackTitle == null || s.trackTitle.length() == 0 ? "Riola" : s.trackTitle)
-                .setContentText(s.stepText)
-                .setSubText(sub)
+                .setContentTitle(s.stepTitle == null || s.stepTitle.length() == 0 ? "Riola" : s.stepTitle)
+                .setContentText(s.stepDetail)
+                .setSubText(sub.toString())
                 .setContentIntent(content)
                 .setOngoing(s.running)
                 .setOnlyAlertOnce(true)
@@ -2173,8 +2496,8 @@ public class PlayerService extends Service implements Engine.Listener {
         if (session == null) return;
         try {
             session.setMetadata(new MediaMetadata.Builder()
-                    .putString(MediaMetadata.METADATA_KEY_TITLE, s.trackTitle)
-                    .putString(MediaMetadata.METADATA_KEY_ARTIST, s.stepText)
+                    .putString(MediaMetadata.METADATA_KEY_TITLE, s.stepTitle)
+                    .putString(MediaMetadata.METADATA_KEY_ARTIST, s.programName)
                     .putString(MediaMetadata.METADATA_KEY_ALBUM, "Riola")
                     .putLong(MediaMetadata.METADATA_KEY_DURATION, s.durMs)
                     .build());
@@ -2249,299 +2572,1669 @@ public class PlayerService extends Service implements Engine.Listener {
 '@
 
 # ---------------------------------------------------------------------------
-# Java: the screen
+# Java: shared transport bar and picker dialogs
 # ---------------------------------------------------------------------------
-Write-Src "$PKG_PATH\MainActivity.java" @'
+Write-Src "$PKG_PATH\PlayerBar.java" @'
+package com.riola.player;
+
+import android.app.Activity;
+import android.content.Intent;
+import android.content.res.ColorStateList;
+import android.view.Gravity;
+import android.view.View;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
+import android.widget.SeekBar;
+import android.widget.TextView;
+
+/** The transport strip pinned to the bottom of a screen while a program runs. */
+public class PlayerBar implements Engine.Listener {
+
+    public interface Host {
+        void onEngineState(Engine.St s);
+        void onEngineFinished(boolean completed);
+    }
+
+    private final Activity act;
+    private final Engine eng;
+    private final Host host;
+
+    public final LinearLayout view;
+    private final TextView title, detail, badge, time, remain;
+    private final SeekBar seek;
+    private final ImageView play;
+    private boolean dragging;
+
+    public PlayerBar(final Activity a, Host h) {
+        act = a;
+        host = h;
+        eng = Engine.get(a);
+
+        view = Ui.col(a);
+        view.setBackgroundColor(Ui.SURF);
+        view.setVisibility(View.GONE);
+
+        View top = new View(a);
+        top.setLayoutParams(Ui.lp(Ui.MATCH, Math.max(1, Ui.dp(a, 0.7f))));
+        top.setBackgroundColor(Ui.LINE);
+        view.addView(top);
+
+        LinearLayout inner = Ui.col(a);
+        inner.setPadding(Ui.dp(a, 14), Ui.dp(a, 10), Ui.dp(a, 14), Ui.dp(a, 12));
+        view.addView(inner);
+
+        LinearLayout line1 = Ui.row(a);
+        title = Ui.tv(a, "", 14.5f, Ui.TXT, true);
+        Ui.ellipsize(title);
+        title.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        line1.addView(title);
+        badge = Ui.badge(a, "", Ui.ONACC, Ui.ACC);
+        line1.addView(badge);
+        inner.addView(line1);
+
+        detail = Ui.tv(a, "", 12, Ui.DIM, false);
+        Ui.ellipsize(detail);
+        inner.addView(detail);
+
+        seek = new SeekBar(a);
+        seek.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
+        seek.setProgressTintList(ColorStateList.valueOf(Ui.ACC));
+        seek.setThumbTintList(ColorStateList.valueOf(Ui.ACC));
+        seek.setProgressBackgroundTintList(ColorStateList.valueOf(Ui.LINE));
+        seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            public void onProgressChanged(SeekBar s, int p, boolean fromUser) { }
+            public void onStartTrackingTouch(SeekBar s) { dragging = true; }
+            public void onStopTrackingTouch(SeekBar s) { dragging = false; eng.seekTo(s.getProgress()); }
+        });
+        Ui.margin(a, seek, 0, 2, 0, 0);
+        inner.addView(seek);
+
+        LinearLayout line3 = Ui.row(a);
+        time = Ui.mono(a, "0:00 / 0:00", 11, Ui.DIM);
+        line3.addView(time);
+        line3.addView(Ui.spring(a));
+        remain = Ui.tv(a, "", 11, Ui.DIM, false);
+        line3.addView(remain);
+        inner.addView(line3);
+
+        LinearLayout tr = Ui.row(a);
+        tr.setGravity(Gravity.CENTER);
+        Ui.margin(a, tr, 0, 6, 0, 0);
+        tr.addView(Ui.roundBtn(a, Ico.PREV, 20, false, "Previous step", new View.OnClickListener() {
+            public void onClick(View v) { Ui.buzz(v); eng.prev(); }
+        }));
+        tr.addView(Ui.hgap(a, 10));
+        play = Ui.roundBtn(a, Ico.PAUSE, 22, true, "Pause", new View.OnClickListener() {
+            public void onClick(View v) { Ui.buzz(v); eng.togglePause(); }
+        });
+        tr.addView(play);
+        tr.addView(Ui.hgap(a, 10));
+        tr.addView(Ui.roundBtn(a, Ico.STOP, 20, false, "Stop", new View.OnClickListener() {
+            public void onClick(View v) { Ui.buzz(v); stop(); }
+        }));
+        tr.addView(Ui.hgap(a, 10));
+        tr.addView(Ui.roundBtn(a, Ico.NEXT, 20, false, "Next step", new View.OnClickListener() {
+            public void onClick(View v) { Ui.buzz(v); eng.next(); }
+        }));
+        inner.addView(tr);
+    }
+
+    public void attach() {
+        eng.addListener(this);
+        render(eng.st);
+    }
+
+    public void detach() { eng.removeListener(this); }
+
+    public void stop() {
+        eng.stop();
+        try { act.stopService(new Intent(act, PlayerService.class)); } catch (Exception e) { /* gone */ }
+        render(eng.st);
+    }
+
+    /** Start the foreground service that keeps playback alive off screen. */
+    public static void startService(Activity a) {
+        Intent i = new Intent(a, PlayerService.class).setAction(PlayerService.ACT_ATTACH);
+        try { a.startForegroundService(i); } catch (Exception e) {
+            try { a.startService(i); } catch (Exception ignored) { }
+        }
+    }
+
+    public void render(Engine.St s) {
+        if (!s.running) {
+            view.setVisibility(View.GONE);
+            return;
+        }
+        view.setVisibility(View.VISIBLE);
+        title.setText(s.stepTitle);
+        detail.setText(s.resting && s.stepDetail.length() == 0 ? "resting" : s.stepDetail);
+
+        if (s.countIn > 0) badge.setText("READY");
+        else if (s.preview) badge.setText("PREVIEW");
+        else badge.setText("STEP " + (s.step + 1) + "/" + s.steps);
+
+        int max = Math.max(1, s.durMs);
+        if (!dragging) {
+            seek.setMax(max);
+            seek.setProgress(Math.min(s.posMs, max));
+        }
+        time.setText(Fmt.ms(s.posMs) + " / " + Fmt.ms(s.durMs));
+
+        String right = "";
+        if (s.stepRemainMs >= 0) right = Fmt.human(s.stepRemainMs) + " left";
+        else if (s.repTotal > 1) right = "pass " + Math.min(s.repDone + 1, s.repTotal) + " of " + s.repTotal;
+        if (s.loopTotal < 0) right = append(right, "loop " + (s.loopDone + 1));
+        else if (s.loopTotal > 1) right = append(right, "loop " + (s.loopDone + 1) + "/" + s.loopTotal);
+        if (s.progRemainMs > 0) right = append(right, "~" + Fmt.human(s.progRemainMs) + " to go");
+        remain.setText(right);
+
+        Ui.setIcon(play, s.paused ? Ico.PLAY : Ico.PAUSE, Ui.ONACC);
+        play.setContentDescription(s.paused ? "Resume" : "Pause");
+    }
+
+    private String append(String a, String b) { return a.length() == 0 ? b : (a + "  .  " + b); }
+
+    // ---- engine callbacks ------------------------------------------------
+    public void onState(Engine.St s) {
+        render(s);
+        if (host != null) host.onEngineState(s);
+    }
+
+    public void onLog(String line) { }
+
+    public void onFinished(boolean completed) {
+        render(eng.st);
+        if (host != null) host.onEngineFinished(completed);
+    }
+}
+'@
+
+Write-Src "$PKG_PATH\Pickers.java" @'
 package com.riola.player;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.content.ClipData;
-import android.content.Context;
-import android.content.Intent;
-import android.content.pm.PackageManager;
-import android.content.res.ColorStateList;
-import android.database.Cursor;
-import android.graphics.Typeface;
-import android.media.MediaMetadataRetriever;
-import android.net.Uri;
-import android.os.Build;
-import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
-import android.provider.DocumentsContract;
-import android.provider.OpenableColumns;
+import android.content.DialogInterface;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
-import android.view.ViewGroup;
-import android.view.WindowManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
-import android.widget.HorizontalScrollView;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
+
+/** Small reusable dialogs: pick a track, a length, a position, or type a name. */
+public final class Pickers {
+
+    public interface OnTrack { void picked(Track t); }
+    public interface OnMs    { void picked(long ms); }
+    public interface OnText  { void picked(String s); }
+
+    private Pickers() { }
+
+    // ---- track -----------------------------------------------------------
+    public static void track(final Activity a, String title, final OnTrack cb) {
+        if (Store.LIB.isEmpty()) {
+            Ui.dialog(a).setTitle("No tracks yet")
+                    .setMessage("Add some audio files first and they will show up here.")
+                    .setNegativeButton("Not now", null)
+                    .setPositiveButton("Add tracks", new DialogInterface.OnClickListener() {
+                        public void onClick(DialogInterface d, int w) {
+                            a.startActivity(new android.content.Intent(a, LibraryActivity.class));
+                        }
+                    }).show();
+            return;
+        }
+
+        LinearLayout box = Ui.col(a);
+        int p = Ui.dp(a, 12);
+        box.setPadding(p, p, p, p);
+
+        final LinearLayout list = Ui.col(a);
+        final AlertDialog[] holder = new AlertDialog[1];
+
+        if (Store.LIB.size() > 7) {
+            final EditText search = new EditText(a);
+            search.setHint("Search tracks");
+            search.setSingleLine(true);
+            search.setTextColor(Ui.TXT);
+            search.setHintTextColor(Ui.DIM);
+            search.setInputType(InputType.TYPE_CLASS_TEXT);
+            search.addTextChangedListener(new TextWatcher() {
+                public void beforeTextChanged(CharSequence s, int x, int y, int z) { }
+                public void onTextChanged(CharSequence s, int x, int y, int z) { }
+                public void afterTextChanged(Editable e) {
+                    fill(a, list, e.toString(), holder, cb);
+                }
+            });
+            box.addView(search);
+        }
+        box.addView(list);
+        fill(a, list, "", holder, cb);
+
+        ScrollView sv = new ScrollView(a);
+        sv.addView(box, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
+        holder[0] = Ui.dialog(a).setTitle(title).setView(sv)
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("Manage tracks", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) {
+                        a.startActivity(new android.content.Intent(a, LibraryActivity.class));
+                    }
+                }).create();
+        holder[0].show();
+    }
+
+    private static void fill(final Activity a, LinearLayout list, String query,
+                             final AlertDialog[] holder, final OnTrack cb) {
+        list.removeAllViews();
+        String q = query.toLowerCase().trim();
+        int shown = 0;
+        for (int i = 0; i < Store.LIB.size(); i++) {
+            final Track t = Store.LIB.get(i);
+            if (q.length() > 0 && !t.shortTitle().toLowerCase().contains(q)) continue;
+            shown++;
+            LinearLayout r = Ui.row(a);
+            r.setBackground(Ui.ripple(Ui.rr(a, Ui.SURF2, 10)));
+            r.setPadding(Ui.dp(a, 12), Ui.dp(a, 10), Ui.dp(a, 12), Ui.dp(a, 10));
+            Ui.margin(a, r, 0, 0, 0, 6);
+            r.addView(Ui.icon(a, Ico.NOTE, Ui.ACC, 16));
+            r.addView(Ui.hgap(a, 10));
+            LinearLayout col = Ui.col(a);
+            col.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+            TextView name = Ui.tv(a, t.shortTitle(), 14, Ui.TXT, false);
+            Ui.ellipsize(name);
+            col.addView(name);
+            col.addView(Ui.tv(a, t.durMs > 0 ? Fmt.ms(t.durMs) : "length unknown", 11, Ui.DIM, false));
+            r.addView(col);
+            r.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    if (holder[0] != null) holder[0].dismiss();
+                    cb.picked(t);
+                }
+            });
+            list.addView(r);
+        }
+        if (shown == 0) list.addView(Ui.tv(a, "Nothing matches that.", 13, Ui.DIM, false));
+    }
+
+    // ---- length ----------------------------------------------------------
+    public static void duration(final Activity a, String title, long ms, final OnMs cb) {
+        final long[] value = { Math.max(0, ms) };
+
+        LinearLayout box = Ui.col(a);
+        int p = Ui.dp(a, 18);
+        box.setPadding(p, Ui.dp(a, 8), p, 0);
+
+        final TextView shown = Ui.tv(a, Fmt.ms(value[0]), 30, Ui.ACC, true);
+        shown.setGravity(Gravity.CENTER);
+        shown.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
+        box.addView(shown);
+
+        LinearLayout quick = Ui.row(a);
+        final int[] presets = { 15, 30, 60, 120, 300, 600, 1200 };
+        for (int i = 0; i < presets.length; i++) {
+            final int secs = presets[i];
+            quick.addView(Ui.chip(a, secs < 60 ? (secs + "s") : ((secs / 60) + "m"), false, new View.OnClickListener() {
+                public void onClick(View v) {
+                    value[0] = secs * 1000L;
+                    shown.setText(Fmt.ms(value[0]));
+                }
+            }));
+        }
+        android.widget.HorizontalScrollView row = new android.widget.HorizontalScrollView(a);
+        row.setHorizontalScrollBarEnabled(false);
+        row.addView(quick, new FrameLayout.LayoutParams(Ui.WRAP, Ui.WRAP));
+        Ui.margin(a, row, 0, 8, 0, 4);
+        box.addView(row);
+
+        box.addView(labelled(a, "Minutes", Ui.stepper(a, (int) (value[0] / 60000L), 0, 600, 1, "", new Ui.OnValue() {
+            public void set(int v) {
+                value[0] = v * 60000L + (value[0] % 60000L);
+                shown.setText(Fmt.ms(value[0]));
+            }
+        })));
+        box.addView(labelled(a, "Seconds", Ui.stepper(a, (int) ((value[0] % 60000L) / 1000L), 0, 55, 5, "", new Ui.OnValue() {
+            public void set(int v) {
+                value[0] = (value[0] / 60000L) * 60000L + v * 1000L;
+                shown.setText(Fmt.ms(value[0]));
+            }
+        })));
+        box.addView(Ui.gap(a, 6));
+
+        Ui.dialog(a).setTitle(title).setView(box)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Set", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) { cb.picked(value[0]); }
+                }).show();
+    }
+
+    // ---- position inside a track ----------------------------------------
+    public static void position(final Activity a, String title, long ms, long maxMs, final OnMs cb) {
+        final long[] value = { Math.max(0, ms) };
+        final long cap = maxMs > 0 ? maxMs : 24L * 3600000L;
+
+        LinearLayout box = Ui.col(a);
+        int p = Ui.dp(a, 18);
+        box.setPadding(p, Ui.dp(a, 8), p, 0);
+
+        final TextView shown = Ui.tv(a, Fmt.ms(value[0]), 30, Ui.ACC, true);
+        shown.setGravity(Gravity.CENTER);
+        shown.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
+        box.addView(shown);
+        if (maxMs > 0) {
+            TextView cap2 = Ui.tv(a, "track is " + Fmt.ms(maxMs) + " long", 11.5f, Ui.DIM, false);
+            cap2.setGravity(Gravity.CENTER);
+            cap2.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
+            box.addView(cap2);
+        }
+
+        box.addView(labelled(a, "Minutes", Ui.stepper(a, (int) (value[0] / 60000L), 0, (int) (cap / 60000L) + 1, 1, "", new Ui.OnValue() {
+            public void set(int v) {
+                value[0] = Math.min(cap, v * 60000L + (value[0] % 60000L));
+                shown.setText(Fmt.ms(value[0]));
+            }
+        })));
+        box.addView(labelled(a, "Seconds", Ui.stepper(a, (int) ((value[0] % 60000L) / 1000L), 0, 59, 1, "", new Ui.OnValue() {
+            public void set(int v) {
+                value[0] = Math.min(cap, (value[0] / 60000L) * 60000L + v * 1000L);
+                shown.setText(Fmt.ms(value[0]));
+            }
+        })));
+        box.addView(Ui.gap(a, 6));
+
+        Ui.dialog(a).setTitle(title).setView(box)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Set", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) { cb.picked(value[0]); }
+                }).show();
+    }
+
+    // ---- text ------------------------------------------------------------
+    public static void text(final Activity a, String title, String value, String hint, final OnText cb) {
+        final EditText in = new EditText(a);
+        in.setSingleLine(true);
+        in.setHint(hint);
+        in.setText(value == null ? "" : value);
+        in.setSelection(in.getText().length());
+        in.setTextColor(Ui.TXT);
+        in.setHintTextColor(Ui.DIM);
+        LinearLayout box = Ui.col(a);
+        int p = Ui.dp(a, 20);
+        box.setPadding(p, Ui.dp(a, 8), p, 0);
+        box.addView(in);
+        Ui.dialog(a).setTitle(title).setView(box)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Save", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) {
+                        String s = in.getText().toString().trim();
+                        if (s.length() == 0) { Ui.toast(a, "Give it a name"); return; }
+                        cb.picked(s);
+                    }
+                }).show();
+    }
+
+    private static View labelled(Activity a, String label, View control) {
+        LinearLayout r = Ui.row(a);
+        Ui.margin(a, r, 0, 6, 0, 0);
+        TextView t = Ui.tv(a, label, 13.5f, Ui.DIM, false);
+        t.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        r.addView(t);
+        control.setLayoutParams(Ui.lp(Ui.dp(a, 170), Ui.WRAP));
+        r.addView(control);
+        return r;
+    }
+}
+'@
+
+# ---------------------------------------------------------------------------
+# Java: home screen (saved programs)
+# ---------------------------------------------------------------------------
+Write-Src "$PKG_PATH\MainActivity.java" @'
+package com.riola.player;
+
+import android.app.Activity;
+import android.content.DialogInterface;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.os.Build;
+import android.os.Bundle;
+import android.view.View;
+import android.view.WindowManager;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
-import android.widget.SeekBar;
-import android.widget.Switch;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
 import java.util.List;
 
-public class MainActivity extends Activity implements Engine.Listener {
+/** Home: the saved programs, each with a play button. */
+public class MainActivity extends Activity implements PlayerBar.Host {
 
-    private static final int REQ_FILES = 101, REQ_TREE = 102, REQ_NOTIF = 103;
-    private static final char NL = (char) 10;
+    private static final int REQ_NOTIF = 103;
 
     private Prefs prefs;
     private Engine eng;
-    private final Handler ui = new Handler(Looper.getMainLooper());
+    private PlayerBar bar;
 
-    private LinearLayout tracksBox, stepsBox, stepsCard, logCard, idleBar, playBar;
-    private EditText editor;
-    private TextView libCount, validateMsg, logView, npTitle, npStep, npBadge, npTime, npRemain, stepsCount;
-    private ScrollView logScroll;
-    private SeekBar seek;
-    private ImageView btnPlay;
-    private final List<View> stepRows = new ArrayList<View>();
-    private boolean dragging;
-    private Runnable pendingValidate;
+    private LinearLayout programsBox, liveCard, liveSteps, emptyBox;
+    private TextView tracksLine, liveTitle;
+    private final List<View> liveRows = new ArrayList<View>();
+    private boolean wasRunning;
+    private String liveProgramId = "";
 
-    // ======================================================================
-    // lifecycle
-    // ======================================================================
     @Override
     protected void onCreate(Bundle saved) {
         prefs = new Prefs(this);
         Ui.theme(prefs.dark());
-        setTheme(prefs.dark() ? android.R.style.Theme_Material_NoActionBar
-                              : android.R.style.Theme_Material_Light_NoActionBar);
+        setTheme(Ui.themeRes(prefs.dark()));
         super.onCreate(saved);
         Store.load(this);
         eng = Engine.get(this);
-
-        setContentView(buildUi());
-        getWindow().setStatusBarColor(Ui.BG);
-        getWindow().setNavigationBarColor(Ui.BG);
-        if (!Ui.dark) {
-            getWindow().getDecorView().setSystemUiVisibility(
-                    View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
-        }
-
-        editor.setText(firstRunText());
-        refreshTracks();
-        validate(false);
-        logView.setText(eng.logText());
-    }
-
-    /** On a fresh install the editor starts with a short commented guide. */
-    private String firstRunText() {
-        String saved = Store.script(this);
-        if (saved.length() > 0 || prefs.seeded()) return saved;
-        prefs.seeded(true);
-        StringBuilder b = new StringBuilder();
-        b.append("# Welcome to Riola.").append(NL);
-        b.append("#").append(NL);
-        b.append("# 1. Add tracks with the buttons above.").append(NL);
-        b.append("# 2. Write one step per line here.").append(NL);
-        b.append("#    Tracks are numbered [0], [1], [2] ...").append(NL);
-        b.append("# 3. Tap RUN PROGRAM.").append(NL);
-        b.append("#").append(NL);
-        b.append("# For example:").append(NL);
-        b.append("#   PLAY 0 2 TIMES").append(NL);
-        b.append("#   SECTION 0 0:30 1:15 FOR 10 MIN").append(NL);
-        b.append("#   PAUSE 5 MIN").append(NL);
-        b.append("#").append(NL);
-        b.append("# Tap the ? in the corner for the whole language.").append(NL);
-        return b.toString();
+        setContentView(build());
+        Ui.applyWindow(this);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        eng.addListener(this);
+        bar.attach();
         if (prefs.keepScreenOn()) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        logCard.setVisibility(prefs.showLog() ? View.VISIBLE : View.GONE);
-        render(eng.st);
+        refresh();
     }
 
     @Override
     protected void onPause() {
-        eng.removeListener(this);
-        if (prefs.autoSave()) Store.script(this, editor.getText().toString());
+        bar.detach();
         super.onPause();
     }
 
     // ======================================================================
     // layout
     // ======================================================================
-    private View buildUi() {
+    private View build() {
         LinearLayout root = Ui.col(this);
         root.setBackgroundColor(Ui.BG);
         root.setFitsSystemWindows(true);
 
-        root.addView(header());
+        View[] actions = {
+            Ui.iconBtn(this, Ico.HELP, Ui.DIM, 20, "Help", new View.OnClickListener() {
+                public void onClick(View v) { help(); }
+            }),
+            Ui.iconBtn(this, Ico.GEAR, Ui.DIM, 20, "Settings", new View.OnClickListener() {
+                public void onClick(View v) { settings(); }
+            })
+        };
+        root.addView(Ui.appBar(this, Ico.NOTE, "Riola", "programmable music player", false, actions));
 
-        ScrollView sv = new ScrollView(this);
-        sv.setLayoutParams(Ui.lpw(Ui.MATCH, 0, 1f));
-        sv.setFillViewport(true);
-        sv.setClipToPadding(false);
         LinearLayout body = Ui.col(this);
-        body.addView(libraryCard());
-        body.addView(programCard());
-        body.addView(stepsCard = stepsCard());
-        body.addView(logCard = logCard());
-        body.addView(Ui.gap(this, 6));
-        sv.addView(body, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
-        root.addView(sv);
 
-        root.addView(transportBar());
+        // tracks shortcut
+        LinearLayout tracks = Ui.card(this);
+        tracks.setPadding(Ui.dp(this, 14), Ui.dp(this, 4), Ui.dp(this, 10), Ui.dp(this, 4));
+        LinearLayout tr = Ui.row(this);
+        tr.setBackground(Ui.ripple(Ui.rr(this, 0x00000000, 12)));
+        tr.setPadding(0, Ui.dp(this, 12), 0, Ui.dp(this, 12));
+        tr.addView(Ui.icon(this, Ico.NOTE, Ui.ACC, 18));
+        tr.addView(Ui.hgap(this, 12));
+        LinearLayout tcol = Ui.col(this);
+        tcol.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        tcol.addView(Ui.tv(this, "Tracks", 15, Ui.TXT, true));
+        tracksLine = Ui.tv(this, "", 12, Ui.DIM, false);
+        tcol.addView(tracksLine);
+        tr.addView(tcol);
+        tr.addView(Ui.icon(this, Ico.RIGHT, Ui.DIM, 14));
+        tr.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { startActivity(new Intent(MainActivity.this, LibraryActivity.class)); }
+        });
+        tracks.addView(tr);
+        body.addView(tracks);
+
+        // live step list while a program runs
+        liveCard = Ui.card(this);
+        LinearLayout lh = Ui.row(this);
+        LinearLayout lhd = Ui.heading(this, Ico.WAVE, "Now playing");
+        lhd.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        lh.addView(lhd);
+        liveTitle = Ui.badge(this, "", Ui.ONACC, Ui.ACC2);
+        lh.addView(liveTitle);
+        liveCard.addView(lh);
+        liveSteps = Ui.col(this);
+        liveCard.addView(liveSteps);
+        liveCard.setVisibility(View.GONE);
+        body.addView(liveCard);
+
+        // programs
+        LinearLayout progs = Ui.card(this);
+        progs.addView(Ui.heading(this, Ico.PROGRAM, "Programs"));
+        programsBox = Ui.col(this);
+        progs.addView(programsBox);
+        emptyBox = Ui.col(this);
+        progs.addView(emptyBox);
+        LinearLayout add = Ui.btn(this, "New program", Ico.PLUS, Ui.PRIMARY, new View.OnClickListener() {
+            public void onClick(View v) { newProgram(); }
+        });
+        add.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
+        Ui.margin(this, add, 0, 10, 0, 0);
+        progs.addView(add);
+        body.addView(progs);
+
+        body.addView(Ui.gap(this, 6));
+        root.addView(Ui.scroller(this, body));
+
+        bar = new PlayerBar(this, this);
+        root.addView(bar.view);
         return root;
     }
 
-    private View header() {
-        LinearLayout h = Ui.row(this);
-        h.setPadding(Ui.dp(this, 16), Ui.dp(this, 14), Ui.dp(this, 8), Ui.dp(this, 8));
-
-        ImageView mark = Ui.icon(this, Ico.NOTE, Ui.ACC, 20);
-        mark.setPadding(Ui.dp(this, 7), Ui.dp(this, 7), Ui.dp(this, 7), Ui.dp(this, 7));
-        mark.setLayoutParams(Ui.lp(Ui.dp(this, 34), Ui.dp(this, 34)));
-        mark.setBackground(Ui.rr(this, Ui.SURF2, 10));
-        h.addView(mark);
-
-        LinearLayout titles = Ui.col(this);
-        titles.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
-        Ui.margin(this, titles, 10, 0, 0, 0);
-        TextView t = Ui.tv(this, "Riola", 20, Ui.TXT, true);
-        t.setLetterSpacing(0.02f);
-        titles.addView(t);
-        titles.addView(Ui.tv(this, "programmable music player", 11, Ui.DIM, false));
-        h.addView(titles);
-
-        h.addView(Ui.iconBtn(this, Ico.HELP, Ui.DIM, 20, new View.OnClickListener() {
-            public void onClick(View v) { helpDialog(); }
-        }));
-        h.addView(Ui.iconBtn(this, Ico.GEAR, Ui.DIM, 20, new View.OnClickListener() {
-            public void onClick(View v) { settingsDialog(); }
-        }));
-        return h;
-    }
-
-    // ---- library ---------------------------------------------------------
-    private View libraryCard() {
-        LinearLayout c = Ui.card(this);
-
-        LinearLayout head = Ui.row(this);
-        LinearLayout hd = Ui.heading(this, Ico.LIST, "Library");
-        hd.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
-        head.addView(hd);
-        libCount = Ui.badge(this, "0 tracks", Ui.DIM, Ui.SURF2);
-        head.addView(libCount);
-        c.addView(head);
-
-        tracksBox = Ui.col(this);
-        c.addView(tracksBox);
-
-        LinearLayout btns = Ui.row(this);
-        Ui.margin(this, btns, 0, 8, 0, 0);
-        LinearLayout add = Ui.btn(this, "Add files", Ico.PLUS, Ui.SECONDARY, new View.OnClickListener() {
-            public void onClick(View v) { pickFiles(); }
-        });
-        Ui.margin(this, add, 0, 0, 8, 0);
-        btns.addView(add);
-        btns.addView(Ui.btn(this, "Add folder", Ico.FOLDER, Ui.SECONDARY, new View.OnClickListener() {
-            public void onClick(View v) { pickFolder(); }
-        }));
-        View spring = new View(this);
-        spring.setLayoutParams(Ui.lpw(0, 1, 1f));
-        btns.addView(spring);
-        btns.addView(Ui.iconBtn(this, Ico.TRASH, Ui.DIM, 18, new View.OnClickListener() {
-            public void onClick(View v) { confirmClearLibrary(); }
-        }));
-        c.addView(btns);
-        return c;
-    }
-
-    private void refreshTracks() {
-        tracksBox.removeAllViews();
+    // ======================================================================
+    // programs
+    // ======================================================================
+    private void refresh() {
         int n = Store.LIB.size();
-        libCount.setText(n + (n == 1 ? " track" : " tracks"));
-        if (n == 0) {
-            TextView empty = Ui.tv(this, "No tracks yet. Add a few files or a whole folder,\nthen write a program that refers to them by number.",
-                    12, Ui.DIM, false);
-            Ui.margin(this, empty, 2, 4, 0, 6);
-            tracksBox.addView(empty);
+        tracksLine.setText(n == 0 ? "none yet - tap to add music"
+                                  : (n + (n == 1 ? " track" : " tracks") + " - tap to manage"));
+
+        programsBox.removeAllViews();
+        emptyBox.removeAllViews();
+        if (Store.PROGRAMS.isEmpty()) {
+            emptyBox.addView(Ui.emptyState(this, Ico.PROGRAM, "No programs yet",
+                    "A program is a list of steps: play a track, loop a section, rest, repeat."));
+            if (!Store.LIB.isEmpty()) {
+                LinearLayout sample = Ui.btn(this, "Create an example program", Ico.COPY, Ui.SECONDARY,
+                        new View.OnClickListener() {
+                            public void onClick(View v) {
+                                Program p = Store.sample();
+                                Store.put(MainActivity.this, p);
+                                refresh();
+                                open(p);
+                            }
+                        });
+                sample.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
+                emptyBox.addView(sample);
+            }
+        } else {
+            for (int i = 0; i < Store.PROGRAMS.size(); i++) {
+                programsBox.addView(programRow(Store.PROGRAMS.get(i)));
+            }
+        }
+        wasRunning = eng.isRunning();
+        buildLive();
+        bar.render(eng.st);
+    }
+
+    private View programRow(final Program p) {
+        final boolean playing = eng.isPlaying(p);
+
+        LinearLayout r = Ui.row(this);
+        r.setBackground(Ui.ripple(playing ? Ui.rrs(this, Ui.SURF2, Ui.ACC, 14, 1.4f)
+                                          : Ui.rr(this, Ui.SURF2, 14)));
+        r.setPadding(Ui.dp(this, 10), Ui.dp(this, 10), Ui.dp(this, 4), Ui.dp(this, 10));
+        Ui.margin(this, r, 0, 0, 0, 8);
+        r.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { open(p); }
+        });
+        r.setOnLongClickListener(new View.OnLongClickListener() {
+            public boolean onLongClick(View v) { menu(p); return true; }
+        });
+
+        ImageView go = Ui.roundBtn(this, playing ? Ico.STOP : Ico.PLAY, 20, true,
+                playing ? "Stop" : "Play " + p.name, new View.OnClickListener() {
+            public void onClick(View v) {
+                Ui.buzz(v);
+                if (eng.isPlaying(p)) bar.stop();
+                else run(p, 0);
+                refresh();
+            }
+        });
+        r.addView(go);
+        r.addView(Ui.hgap(this, 12));
+
+        LinearLayout col = Ui.col(this);
+        col.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        TextView name = Ui.tv(this, p.name, 15.5f, Ui.TXT, true);
+        Ui.ellipsize(name);
+        col.addView(name);
+        TextView sum = Ui.tv(this, p.summary(), 12, Ui.DIM, false);
+        Ui.ellipsize(sum);
+        col.addView(sum);
+        LinearLayout tags = Ui.row(this);
+        if (playing) {
+            tags.addView(Ui.badge(this, "PLAYING", Ui.ONACC, Ui.GREEN));
+            tags.addView(Ui.hgap(this, 6));
+        }
+        if (p.hasMissing()) {
+            tags.addView(Ui.badge(this, "MISSING TRACK", Ui.ONACC, Ui.AMBER));
+            tags.addView(Ui.hgap(this, 6));
+        }
+        if (p.lastRun > 0) tags.addView(Ui.tv(this, "last run " + Fmt.ago(p.lastRun), 11, Ui.DIM, false));
+        if (tags.getChildCount() > 0) {
+            Ui.margin(this, tags, 0, 4, 0, 0);
+            col.addView(tags);
+        }
+        r.addView(col);
+
+        r.addView(Ui.iconBtn(this, Ico.MORE, Ui.DIM, 16, "More options", new View.OnClickListener() {
+            public void onClick(View v) { menu(p); }
+        }));
+        return r;
+    }
+
+    private void menu(final Program p) {
+        final String[] items = { "Play", "Edit", "Rename", "Duplicate", "Delete" };
+        Ui.dialog(this).setTitle(p.name).setItems(items, new DialogInterface.OnClickListener() {
+            public void onClick(DialogInterface d, int which) {
+                switch (which) {
+                    case 0: run(p, 0); refresh(); break;
+                    case 1: open(p); break;
+                    case 2:
+                        Pickers.text(MainActivity.this, "Rename program", p.name, "name", new Pickers.OnText() {
+                            public void picked(String s) {
+                                p.name = s;
+                                Store.put(MainActivity.this, p);
+                                refresh();
+                            }
+                        });
+                        break;
+                    case 3: {
+                        Program copy = p.copyAs(p.name + " copy");
+                        Store.put(MainActivity.this, copy);
+                        refresh();
+                        Ui.toast(MainActivity.this, "Duplicated");
+                        break;
+                    }
+                    default:
+                        Ui.dialog(MainActivity.this).setTitle("Delete " + p.name + "?")
+                                .setMessage("The program is removed. Your audio files are untouched.")
+                                .setNegativeButton("Cancel", null)
+                                .setPositiveButton("Delete", new DialogInterface.OnClickListener() {
+                                    public void onClick(DialogInterface dd, int w) {
+                                        if (eng.isPlaying(p)) bar.stop();
+                                        Store.delete(MainActivity.this, p);
+                                        refresh();
+                                    }
+                                }).show();
+                }
+            }
+        }).show();
+    }
+
+    private void newProgram() {
+        Pickers.text(this, "New program", "Program " + (Store.PROGRAMS.size() + 1), "name", new Pickers.OnText() {
+            public void picked(String s) {
+                Program p = Program.blank(s);
+                Store.put(MainActivity.this, p);
+                refresh();
+                open(p);
+            }
+        });
+    }
+
+    private void open(Program p) {
+        startActivity(new Intent(this, EditorActivity.class).putExtra("id", p.id));
+    }
+
+    private void run(Program p, int from) {
+        if (p.enabledCount() == 0) {
+            Ui.toast(this, "Add a step first");
+            open(p);
             return;
         }
-        for (int i = 0; i < n; i++) tracksBox.addView(trackRow(i, Store.LIB.get(i)));
+        askNotificationPermission();
+        p.lastRun = System.currentTimeMillis();
+        Store.savePrograms(this);
+        eng.start(p, from);
+        PlayerBar.startService(this);
+        liveProgramId = "";
+        buildLive();
     }
 
-    private View trackRow(final int index, Track t) {
+    private void askNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{ "android.permission.POST_NOTIFICATIONS" }, REQ_NOTIF);
+        }
+    }
+
+    // ======================================================================
+    // live step list
+    // ======================================================================
+    private void buildLive() {
+        Engine.St s = eng.st;
+        Program p = Store.program(s.programId);
+        if (!s.running || p == null) {
+            liveCard.setVisibility(View.GONE);
+            liveRows.clear();
+            liveSteps.removeAllViews();
+            liveProgramId = "";
+            return;
+        }
+        liveCard.setVisibility(View.VISIBLE);
+        liveTitle.setText(p.name.toUpperCase());
+        if (p.id.equals(liveProgramId) && liveRows.size() == p.steps.size()) {
+            highlight(s.step);
+            return;
+        }
+        liveProgramId = p.id;
+        liveSteps.removeAllViews();
+        liveRows.clear();
+        for (int i = 0; i < p.steps.size(); i++) {
+            final int index = i;
+            Step st = p.steps.get(i);
+            LinearLayout r = Ui.row(this);
+            r.setPadding(Ui.dp(this, 8), Ui.dp(this, 7), Ui.dp(this, 8), Ui.dp(this, 7));
+            Ui.margin(this, r, 0, 0, 0, 2);
+            r.addView(Ui.icon(this, stepIcon(st), st.enabled ? Ui.DIM : Ui.LINE, 15));
+            r.addView(Ui.hgap(this, 10));
+            LinearLayout col = Ui.col(this);
+            col.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+            TextView t = Ui.tv(this, st.title(), 13, st.enabled ? Ui.TXT : Ui.DIM, false);
+            Ui.ellipsize(t);
+            col.addView(t);
+            TextView d = Ui.tv(this, st.detail(), 11, Ui.DIM, false);
+            Ui.ellipsize(d);
+            col.addView(d);
+            r.addView(col);
+            r.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) { Ui.buzz(v); eng.jumpTo(index); }
+            });
+            liveRows.add(r);
+            liveSteps.addView(r);
+        }
+        highlight(s.step);
+    }
+
+    static int stepIcon(Step s) {
+        if (s.type == Step.SILENCE) return Ico.CLOCK;
+        if (s.type == Step.SECTION) return Ico.AB;
+        return Ico.NOTE;
+    }
+
+    private void highlight(int active) {
+        for (int i = 0; i < liveRows.size(); i++) {
+            View v = liveRows.get(i);
+            if (i == active) v.setBackground(Ui.rrs(this, Ui.dark ? 0xFF10202B : 0xFFE3F2FB, Ui.ACC, 10, 1));
+            else v.setBackground(Ui.ripple(Ui.rr(this, 0x00000000, 10)));
+        }
+    }
+
+    // ======================================================================
+    // engine callbacks
+    // ======================================================================
+    public void onEngineState(Engine.St s) {
+        if (s.running != wasRunning) {
+            wasRunning = s.running;
+            refresh();
+            return;
+        }
+        buildLive();
+    }
+
+    public void onEngineFinished(boolean completed) {
+        refresh();
+        Ui.toast(this, completed ? "Program finished" : "Stopped");
+    }
+
+    // ======================================================================
+    // dialogs
+    // ======================================================================
+    private void help() {
+        ScrollView sv = new ScrollView(this);
+        TextView t = Ui.mono(this, HelpText.TEXT, 11, Ui.TXT);
+        int p = Ui.dp(this, 16);
+        t.setPadding(p, p, p, p);
+        t.setTextIsSelectable(true);
+        sv.addView(t, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
+        Ui.dialog(this).setTitle("How Riola works").setView(sv).setPositiveButton("Close", null).show();
+    }
+
+    private void settings() {
+        LinearLayout box = Ui.col(this);
+        int p = Ui.dp(this, 18);
+        box.setPadding(p, Ui.dp(this, 6), p, 0);
+
+        box.addView(Ui.switchRow(this, "Dark theme", null, prefs.dark(), new Ui.OnToggle() {
+            public void set(boolean v) { prefs.dark(v); recreate(); }
+        }));
+        box.addView(Ui.switchRow(this, "Keep the screen on", "while the app is open",
+                prefs.keepScreenOn(), new Ui.OnToggle() {
+            public void set(boolean v) {
+                prefs.keepScreenOn(v);
+                if (v) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            }
+        }));
+        box.addView(Ui.switchRow(this, "Keep the CPU awake", "so long rests stay exact",
+                prefs.wakeLock(), new Ui.OnToggle() {
+            public void set(boolean v) { prefs.wakeLock(v); }
+        }));
+        box.addView(Ui.switchRow(this, "Pause when headphones unplug", null,
+                prefs.pauseUnplug(), new Ui.OnToggle() {
+            public void set(boolean v) { prefs.pauseUnplug(v); }
+        }));
+        box.addView(Ui.switchRow(this, "Pause for calls and other apps", null,
+                prefs.pauseOnFocus(), new Ui.OnToggle() {
+            public void set(boolean v) { prefs.pauseOnFocus(v); }
+        }));
+        box.addView(Ui.switchRow(this, "Vibrate on button taps", null,
+                prefs.haptics(), new Ui.OnToggle() {
+            public void set(boolean v) { prefs.haptics(v); }
+        }));
+
+        box.addView(Ui.divider(this));
+        box.addView(Ui.sliderRow(this, "Master volume", 0, 100, prefs.volume(), "%", new Ui.OnSlide() {
+            public void set(int v) { prefs.volume(v); eng.setMasterVolume(v); }
+        }));
+        box.addView(Ui.sliderRow(this, "Playback speed", 50, 200, prefs.speedPct(), "%", new Ui.OnSlide() {
+            public void set(int v) { prefs.speedPct(v); eng.setMasterSpeed(v); }
+        }));
+        box.addView(Ui.sliderRow(this, "Fade at loop edges", 0, 1000, prefs.fadeMs(), " ms", new Ui.OnSlide() {
+            public void set(int v) { prefs.fadeMs(v); }
+        }));
+        box.addView(Ui.sliderRow(this, "Count in before starting", 0, 15, prefs.countIn(), " s", new Ui.OnSlide() {
+            public void set(int v) { prefs.countIn(v); }
+        }));
+        box.addView(Ui.sliderRow(this, "Stop everything after", 0, 180, prefs.autoStopMin(), " min", new Ui.OnSlide() {
+            public void set(int v) { prefs.autoStopMin(v); }
+        }));
+        TextView note = Ui.tv(this, "Set the stop timer to 0 to switch it off.", 11, Ui.DIM, false);
+        box.addView(note);
+
+        box.addView(Ui.divider(this));
+        box.addView(Ui.btn(this, "Reset settings to defaults", 0, Ui.DANGER, new View.OnClickListener() {
+            public void onClick(View v) {
+                prefs.resetAll();
+                Ui.toast(MainActivity.this, "Settings reset");
+                recreate();
+            }
+        }));
+        box.addView(Ui.gap(this, 6));
+        box.addView(Ui.tv(this, "Riola 4.0  -  no ads, no network, no accounts.", 11, Ui.DIM, false));
+        box.addView(Ui.gap(this, 6));
+
+        ScrollView sv = new ScrollView(this);
+        sv.addView(box, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
+        Ui.dialog(this).setTitle("Settings").setView(sv).setPositiveButton("Done", null).show();
+    }
+}
+'@
+
+# ---------------------------------------------------------------------------
+# Java: program editor and the step sheet
+# ---------------------------------------------------------------------------
+Write-Src "$PKG_PATH\EditorActivity.java" @'
+package com.riola.player;
+
+import android.app.Activity;
+import android.content.DialogInterface;
+import android.os.Bundle;
+import android.view.Gravity;
+import android.view.View;
+import android.view.WindowManager;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/** Build a program by tapping: no typing, no syntax. */
+public class EditorActivity extends Activity implements PlayerBar.Host {
+
+    private Prefs prefs;
+    private Engine eng;
+    private PlayerBar bar;
+    private Program prog;
+
+    private LinearLayout stepsBox, loopBox;
+    private TextView titleView, subView, totalBadge;
+    private final List<View> rows = new ArrayList<View>();
+
+    @Override
+    protected void onCreate(Bundle saved) {
+        prefs = new Prefs(this);
+        Ui.theme(prefs.dark());
+        setTheme(Ui.themeRes(prefs.dark()));
+        super.onCreate(saved);
+        Store.load(this);
+        eng = Engine.get(this);
+        prog = Store.program(getIntent().getStringExtra("id"));
+        if (prog == null) { finish(); return; }
+        setContentView(build());
+        Ui.applyWindow(this);
+        refresh();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (prog == null) return;
+        bar.attach();
+        if (prefs.keepScreenOn()) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        refresh();
+    }
+
+    @Override
+    protected void onPause() {
+        if (prog != null) {
+            bar.detach();
+            Store.put(this, prog);
+        }
+        super.onPause();
+    }
+
+    // ======================================================================
+    // layout
+    // ======================================================================
+    private View build() {
+        LinearLayout root = Ui.col(this);
+        root.setBackgroundColor(Ui.BG);
+        root.setFitsSystemWindows(true);
+
+        View[] actions = {
+            Ui.iconBtn(this, Ico.PLAY, Ui.ACC, 20, "Run this program", new View.OnClickListener() {
+                public void onClick(View v) { run(0); }
+            }),
+            Ui.iconBtn(this, Ico.MORE, Ui.DIM, 20, "More options", new View.OnClickListener() {
+                public void onClick(View v) { menu(); }
+            })
+        };
+        LinearLayout header = Ui.appBar(this, 0, prog.name, prog.summary(), true, actions);
+        LinearLayout titles = (LinearLayout) header.getChildAt(1);
+        titleView = (TextView) titles.getChildAt(0);
+        subView = (TextView) titles.getChildAt(1);
+        titles.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { rename(); }
+        });
+        root.addView(header);
+
+        LinearLayout body = Ui.col(this);
+
+        LinearLayout loops = Ui.card(this);
+        loops.addView(Ui.heading(this, Ico.LOOP, "Repeat program"));
+        loopBox = Ui.col(this);
+        loops.addView(loopBox);
+        body.addView(loops);
+
+        LinearLayout card = Ui.card(this);
+        LinearLayout head = Ui.row(this);
+        LinearLayout hd = Ui.heading(this, Ico.LIST, "Steps");
+        hd.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        head.addView(hd);
+        totalBadge = Ui.badge(this, "", Ui.DIM, Ui.SURF2);
+        head.addView(totalBadge);
+        card.addView(head);
+
+        stepsBox = Ui.col(this);
+        card.addView(stepsBox);
+
+        LinearLayout add = Ui.btn(this, "Add step", Ico.PLUS, Ui.PRIMARY, new View.OnClickListener() {
+            public void onClick(View v) { addStep(); }
+        });
+        add.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
+        Ui.margin(this, add, 0, 10, 0, 0);
+        card.addView(add);
+        body.addView(card);
+
+        body.addView(Ui.gap(this, 6));
+        root.addView(Ui.scroller(this, body));
+
+        bar = new PlayerBar(this, this);
+        root.addView(bar.view);
+        return root;
+    }
+
+    private void refresh() {
+        if (prog == null) return;
+        titleView.setText(prog.name);
+        subView.setText(prog.summary());
+        totalBadge.setText(prog.steps.isEmpty() ? "empty" : Fmt.rough(prog.estMs()));
+
+        loopBox.removeAllViews();
+        final int mode = prog.loops < 0 ? 2 : (prog.loops <= 1 ? 0 : 1);
+        loopBox.addView(Ui.seg(this, new String[]{ "Once", "A few times", "Forever" }, mode, new Ui.OnPick() {
+            public void set(int index) {
+                prog.loops = index == 0 ? 1 : (index == 1 ? Math.max(2, prog.loops) : -1);
+                save();
+                refresh();
+            }
+        }));
+        if (mode == 1) {
+            LinearLayout r = Ui.row(this);
+            Ui.margin(this, r, 0, 8, 0, 0);
+            TextView t = Ui.tv(this, "Run the whole list", 13.5f, Ui.DIM, false);
+            t.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+            r.addView(t);
+            LinearLayout st = Ui.stepper(this, Math.max(2, prog.loops), 2, 99, 1, "x", new Ui.OnValue() {
+                public void set(int v) { prog.loops = v; save(); subView.setText(prog.summary()); }
+            });
+            st.setLayoutParams(Ui.lp(Ui.dp(this, 160), Ui.WRAP));
+            r.addView(st);
+            loopBox.addView(r);
+        }
+
+        stepsBox.removeAllViews();
+        rows.clear();
+        if (prog.steps.isEmpty()) {
+            stepsBox.addView(Ui.emptyState(this, Ico.LIST, "No steps yet",
+                    "Add a whole track, a section of a track, or a stretch of silence."));
+        } else {
+            for (int i = 0; i < prog.steps.size(); i++) stepsBox.addView(stepRow(i));
+        }
+        bar.render(eng.st);
+    }
+
+    private View stepRow(final int index) {
+        final Step s = prog.steps.get(index);
+        final boolean on = s.enabled;
+        boolean live = eng.isPlaying(prog) && eng.st.step == index;
+
+        LinearLayout r = Ui.row(this);
+        r.setBackground(live ? Ui.rrs(this, Ui.dark ? 0xFF10202B : 0xFFE3F2FB, Ui.ACC, 14, 1.4f)
+                             : Ui.ripple(Ui.rr(this, Ui.SURF2, 14)));
+        r.setPadding(Ui.dp(this, 8), Ui.dp(this, 9), Ui.dp(this, 2), Ui.dp(this, 9));
+        Ui.margin(this, r, 0, 0, 0, 8);
+        r.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { edit(index); }
+        });
+        r.setOnLongClickListener(new View.OnLongClickListener() {
+            public boolean onLongClick(View v) { stepMenu(index); return true; }
+        });
+
+        LinearLayout num = Ui.col(this);
+        num.setLayoutParams(Ui.lp(Ui.dp(this, 28), Ui.WRAP));
+        TextView n = Ui.tv(this, String.valueOf(index + 1), 12, on ? Ui.DIM : Ui.LINE, true);
+        n.setGravity(Gravity.CENTER);
+        n.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
+        num.addView(n);
+        ImageView ic = Ui.icon(this, MainActivity.stepIcon(s), on ? Ui.ACC : Ui.LINE, 15);
+        ic.setLayoutParams(Ui.lp(Ui.dp(this, 28), Ui.dp(this, 18)));
+        num.addView(ic);
+        r.addView(num);
+        r.addView(Ui.hgap(this, 8));
+
+        LinearLayout col = Ui.col(this);
+        col.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        LinearLayout tl = Ui.row(this);
+        TextView t = Ui.tv(this, s.title(), 14.5f, on ? Ui.TXT : Ui.DIM, true);
+        Ui.ellipsize(t);
+        t.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        tl.addView(t);
+        if (!on) tl.addView(Ui.badge(this, "OFF", Ui.DIM, Ui.SURF));
+        else if (s.missing()) tl.addView(Ui.badge(this, "MISSING", Ui.ONACC, Ui.AMBER));
+        col.addView(tl);
+        TextView d = Ui.tv(this, s.detail(), 11.5f, Ui.DIM, false);
+        Ui.ellipsize(d);
+        col.addView(d);
+        r.addView(col);
+
+        // wrap, not match: a match-width column here would swallow the title
+        LinearLayout arrows = Ui.col(this);
+        arrows.setLayoutParams(Ui.lp(Ui.WRAP, Ui.WRAP));
+        arrows.addView(Ui.iconBtn(this, Ico.UP, index == 0 ? Ui.LINE : Ui.DIM, 14, 6, "Move up",
+                new View.OnClickListener() {
+            public void onClick(View v) { move(index, -1); }
+        }));
+        arrows.addView(Ui.iconBtn(this, Ico.DOWN, index == prog.steps.size() - 1 ? Ui.LINE : Ui.DIM, 14, 6,
+                "Move down", new View.OnClickListener() {
+            public void onClick(View v) { move(index, 1); }
+        }));
+        r.addView(arrows);
+
+        r.addView(Ui.iconBtn(this, Ico.MORE, Ui.DIM, 16, "Step options", new View.OnClickListener() {
+            public void onClick(View v) { stepMenu(index); }
+        }));
+        rows.add(r);
+        return r;
+    }
+
+    // ======================================================================
+    // actions
+    // ======================================================================
+    private void addStep() {
+        final String[] items = { "Whole track", "Section of a track", "Silence" };
+        Ui.dialog(this).setTitle("Add step").setItems(items, new DialogInterface.OnClickListener() {
+            public void onClick(DialogInterface d, int which) {
+                if (which == 2) {
+                    prog.steps.add(Step.silence(60000));
+                    save();
+                    refresh();
+                    edit(prog.steps.size() - 1);
+                    return;
+                }
+                final boolean section = which == 1;
+                Pickers.track(EditorActivity.this, section ? "Section of which track?" : "Which track?",
+                        new Pickers.OnTrack() {
+                    public void picked(Track t) {
+                        Step s;
+                        if (section) {
+                            long end = t.durMs > 45000 ? 45000 : Math.max(10000, t.durMs);
+                            long from = end > 20000 ? 15000 : 0;
+                            s = Step.section(t, from, end);
+                            s.times = 4;
+                        } else {
+                            s = Step.play(t);
+                        }
+                        prog.steps.add(s);
+                        save();
+                        refresh();
+                        edit(prog.steps.size() - 1);
+                    }
+                });
+            }
+        }).show();
+    }
+
+    private void edit(final int index) {
+        if (index < 0 || index >= prog.steps.size()) return;
+        StepSheet.show(this, prog, index, new StepSheet.OnDone() {
+            public void changed() { save(); refresh(); }
+        });
+    }
+
+    private void stepMenu(final int index) {
+        if (index < 0 || index >= prog.steps.size()) return;
+        final Step s = prog.steps.get(index);
+        final String[] items = { "Edit", "Play from here", s.enabled ? "Turn off" : "Turn on",
+                                 "Duplicate", "Move up", "Move down", "Delete" };
+        Ui.dialog(this).setTitle(s.title()).setItems(items, new DialogInterface.OnClickListener() {
+            public void onClick(DialogInterface d, int which) {
+                switch (which) {
+                    case 0: edit(index); break;
+                    case 1: run(index); break;
+                    case 2: s.enabled = !s.enabled; save(); refresh(); break;
+                    case 3: prog.steps.add(index + 1, s.copy()); save(); refresh(); break;
+                    case 4: move(index, -1); break;
+                    case 5: move(index, 1); break;
+                    default:
+                        prog.steps.remove(index);
+                        save();
+                        refresh();
+                        Ui.toast(EditorActivity.this, "Step removed");
+                }
+            }
+        }).show();
+    }
+
+    private void move(int index, int dir) {
+        int to = index + dir;
+        if (to < 0 || to >= prog.steps.size()) return;
+        Step s = prog.steps.remove(index);
+        prog.steps.add(to, s);
+        save();
+        refresh();
+    }
+
+    private void rename() {
+        Pickers.text(this, "Rename program", prog.name, "name", new Pickers.OnText() {
+            public void picked(String s) { prog.name = s; save(); refresh(); }
+        });
+    }
+
+    private void menu() {
+        final String[] items = { "Rename", "Duplicate", "Delete program" };
+        Ui.dialog(this).setTitle(prog.name).setItems(items, new DialogInterface.OnClickListener() {
+            public void onClick(DialogInterface d, int which) {
+                if (which == 0) {
+                    rename();
+                } else if (which == 1) {
+                    Store.put(EditorActivity.this, prog.copyAs(prog.name + " copy"));
+                    Ui.toast(EditorActivity.this, "Duplicated");
+                } else {
+                    Ui.dialog(EditorActivity.this).setTitle("Delete " + prog.name + "?")
+                            .setNegativeButton("Cancel", null)
+                            .setPositiveButton("Delete", new DialogInterface.OnClickListener() {
+                                public void onClick(DialogInterface dd, int w) {
+                                    if (eng.isPlaying(prog)) bar.stop();
+                                    Store.delete(EditorActivity.this, prog);
+                                    prog = null;
+                                    finish();
+                                }
+                            }).show();
+                }
+            }
+        }).show();
+    }
+
+    private void run(int from) {
+        if (prog.enabledCount() == 0) { Ui.toast(this, "Add a step first"); return; }
+        save();
+        prog.lastRun = System.currentTimeMillis();
+        Store.savePrograms(this);
+        eng.start(prog, from);
+        PlayerBar.startService(this);
+        refresh();
+    }
+
+    private void save() {
+        if (prog != null) Store.put(this, prog);
+    }
+
+    // ======================================================================
+    // engine callbacks
+    // ======================================================================
+    public void onEngineState(Engine.St s) {
+        if (prog == null) return;
+        for (int i = 0; i < rows.size(); i++) {
+            boolean live = s.running && prog.id.equals(s.programId) && s.step == i;
+            rows.get(i).setBackground(live
+                    ? Ui.rrs(this, Ui.dark ? 0xFF10202B : 0xFFE3F2FB, Ui.ACC, 14, 1.4f)
+                    : Ui.ripple(Ui.rr(this, Ui.SURF2, 14)));
+        }
+    }
+
+    public void onEngineFinished(boolean completed) { refresh(); }
+}
+'@
+
+Write-Src "$PKG_PATH\StepSheet.java" @'
+package com.riola.player;
+
+import android.app.Activity;
+import android.content.DialogInterface;
+import android.view.View;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
+
+/** The editor for a single step. Everything is tapped, nothing is typed. */
+public final class StepSheet {
+
+    public interface OnDone { void changed(); }
+
+    private StepSheet() { }
+
+    public static void show(final Activity a, final Program prog, final int index, final OnDone cb) {
+        if (index < 0 || index >= prog.steps.size()) return;
+        final Step step = prog.steps.get(index).copy();
+
+        final LinearLayout content = Ui.col(a);
+        int p = Ui.dp(a, 18);
+        content.setPadding(p, Ui.dp(a, 4), p, 0);
+
+        ScrollView sv = new ScrollView(a);
+        sv.addView(content, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
+
+        final Runnable[] render = new Runnable[1];
+        render[0] = new Runnable() {
+            public void run() { fill(a, content, step, render[0]); }
+        };
+        render[0].run();
+
+        String kind = step.type == Step.SILENCE ? "Silence"
+                : (step.type == Step.SECTION ? "Section" : "Whole track");
+
+        Ui.dialog(a).setTitle("Step " + (index + 1) + "  -  " + kind)
+                .setView(sv)
+                .setNeutralButton("Delete", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) {
+                        prog.steps.remove(index);
+                        cb.changed();
+                        Ui.toast(a, "Step removed");
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Save", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) {
+                        prog.steps.set(index, step);
+                        cb.changed();
+                    }
+                }).show();
+    }
+
+    private static void fill(final Activity a, final LinearLayout box, final Step step, final Runnable again) {
+        box.removeAllViews();
+
+        if (step.type != Step.SILENCE) {
+            Track bound = step.track();
+            String label = bound != null ? bound.shortTitle()
+                    : (step.trackName.length() > 0 ? step.trackName + "  (missing)" : "pick a track");
+            box.addView(Ui.field(a, "Track", label, Ico.NOTE, new View.OnClickListener() {
+                public void onClick(View v) {
+                    Pickers.track(a, "Which track?", new Pickers.OnTrack() {
+                        public void picked(Track picked) {
+                            step.bind(picked);
+                            if (step.type == Step.SECTION && picked.durMs > 0 && step.b > picked.durMs) {
+                                step.b = picked.durMs;
+                            }
+                            again.run();
+                        }
+                    });
+                }
+            }));
+        }
+
+        if (step.type == Step.SECTION) {
+            final Track t = step.track();
+            final long cap = t == null ? 0 : t.durMs;
+
+            LinearLayout ab = Ui.row(a);
+            LinearLayout left = Ui.col(a);
+            left.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+            left.addView(Ui.field(a, "Start (A)", Fmt.ms(step.a), Ico.CLOCK, new View.OnClickListener() {
+                public void onClick(View v) {
+                    Pickers.position(a, "Section starts at", step.a, cap, new Pickers.OnMs() {
+                        public void picked(long ms) {
+                            step.a = ms;
+                            if (step.b >= 0 && step.b <= step.a) step.b = step.a + 15000;
+                            again.run();
+                        }
+                    });
+                }
+            }));
+            LinearLayout right = Ui.col(a);
+            right.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+            Ui.margin(a, right, 8, 0, 0, 0);
+            right.addView(Ui.field(a, "End (B)", step.b < 0 ? "end of track" : Fmt.ms(step.b),
+                    Ico.CLOCK, new View.OnClickListener() {
+                public void onClick(View v) {
+                    Pickers.position(a, "Section ends at", step.b < 0 ? cap : step.b, cap, new Pickers.OnMs() {
+                        public void picked(long ms) {
+                            step.b = ms <= step.a ? step.a + 15000 : ms;
+                            again.run();
+                        }
+                    });
+                }
+            }));
+            ab.addView(left);
+            ab.addView(right);
+            box.addView(ab);
+
+            LinearLayout ear = Ui.btn(a, "Pick by ear", Ico.AB, Ui.SECONDARY, new View.OnClickListener() {
+                public void onClick(View v) {
+                    if (t == null) { Ui.toast(a, "Pick a track first"); return; }
+                    AbDialog.show(a, t, step.a, step.b, new AbDialog.OnPick() {
+                        public void picked(long from, long to) {
+                            step.a = from;
+                            step.b = to;
+                            again.run();
+                        }
+                    });
+                }
+            });
+            ear.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
+            Ui.margin(a, ear, 0, 8, 0, 0);
+            box.addView(ear);
+
+            if (step.b > 0) {
+                TextView len = Ui.tv(a, "that slice is " + Fmt.human(Math.max(0, step.b - step.a)) + " long",
+                        11.5f, Ui.DIM, false);
+                Ui.margin(a, len, 2, 6, 0, 0);
+                box.addView(len);
+            }
+        }
+
+        if (step.type == Step.SILENCE) {
+            box.addView(Ui.field(a, "How long", Fmt.human(step.durMs), Ico.CLOCK, new View.OnClickListener() {
+                public void onClick(View v) {
+                    Pickers.duration(a, "Silence for", step.durMs, new Pickers.OnMs() {
+                        public void picked(long ms) { step.durMs = Math.max(1000, ms); again.run(); }
+                    });
+                }
+            }));
+        } else {
+            box.addView(Ui.gap(a, 10));
+            box.addView(Ui.tv(a, "HOW OFTEN", 11, Ui.DIM, true));
+            box.addView(Ui.gap(a, 6));
+            box.addView(Ui.seg(a, new String[]{ "A number of times", "For a length of time" },
+                    step.timed() ? 1 : 0, new Ui.OnPick() {
+                public void set(int i) {
+                    if (i == 0) step.times = 1;
+                    else { step.times = -1; if (step.durMs <= 0) step.durMs = 600000; }
+                    again.run();
+                }
+            }));
+            if (step.timed()) {
+                box.addView(Ui.field(a, "Keep looping for", Fmt.human(step.durMs), Ico.CLOCK,
+                        new View.OnClickListener() {
+                    public void onClick(View v) {
+                        Pickers.duration(a, "Loop for", step.durMs, new Pickers.OnMs() {
+                            public void picked(long ms) { step.durMs = Math.max(5000, ms); again.run(); }
+                        });
+                    }
+                }));
+            } else {
+                LinearLayout r = Ui.row(a);
+                Ui.margin(a, r, 0, 8, 0, 0);
+                TextView t = Ui.tv(a, "Play it", 13.5f, Ui.DIM, false);
+                t.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+                r.addView(t);
+                LinearLayout st = Ui.stepper(a, Math.max(1, step.times), 1, 99, 1, "x", new Ui.OnValue() {
+                    public void set(int v) { step.times = v; }
+                });
+                st.setLayoutParams(Ui.lp(Ui.dp(a, 160), Ui.WRAP));
+                r.addView(st);
+                box.addView(r);
+            }
+
+            LinearLayout g = Ui.row(a);
+            Ui.margin(a, g, 0, 10, 0, 0);
+            LinearLayout gl = Ui.col(a);
+            gl.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+            gl.addView(Ui.tv(a, "Gap between repeats", 13.5f, Ui.DIM, false));
+            gl.addView(Ui.tv(a, "a short rest each time round", 11, Ui.DIM, false));
+            g.addView(gl);
+            LinearLayout gs = Ui.stepper(a, (int) (step.gapMs / 1000L), 0, 300, 5, "s", new Ui.OnValue() {
+                public void set(int v) { step.gapMs = v * 1000L; }
+            });
+            gs.setLayoutParams(Ui.lp(Ui.dp(a, 150), Ui.WRAP));
+            g.addView(gs);
+            box.addView(g);
+
+            box.addView(Ui.divider(a));
+            box.addView(Ui.sliderRow(a, "Speed for this step", 50, 200, step.speedPct, "%", new Ui.OnSlide() {
+                public void set(int v) { step.speedPct = v; }
+            }));
+            box.addView(Ui.sliderRow(a, "Volume for this step", 10, 100, step.volumePct, "%", new Ui.OnSlide() {
+                public void set(int v) { step.volumePct = v; }
+            }));
+        }
+
+        box.addView(Ui.divider(a));
+        box.addView(Ui.switchRow(a, "Include this step", "turn it off to skip it for now",
+                step.enabled, new Ui.OnToggle() {
+            public void set(boolean v) { step.enabled = v; }
+        }));
+        box.addView(Ui.gap(a, 8));
+    }
+}
+'@
+
+# ---------------------------------------------------------------------------
+# Java: the track library
+# ---------------------------------------------------------------------------
+Write-Src "$PKG_PATH\LibraryActivity.java" @'
+package com.riola.player;
+
+import android.app.Activity;
+import android.content.ClipData;
+import android.content.DialogInterface;
+import android.content.Intent;
+import android.database.Cursor;
+import android.media.MediaMetadataRetriever;
+import android.net.Uri;
+import android.os.Bundle;
+import android.provider.DocumentsContract;
+import android.provider.OpenableColumns;
+import android.view.View;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+
+/** Add, preview and organise the audio files Riola may use. */
+public class LibraryActivity extends Activity implements PlayerBar.Host {
+
+    private static final int REQ_FILES = 101, REQ_TREE = 102;
+
+    private Prefs prefs;
+    private Engine eng;
+    private PlayerBar bar;
+    private LinearLayout listBox;
+    private TextView subtitle;
+
+    @Override
+    protected void onCreate(Bundle saved) {
+        prefs = new Prefs(this);
+        Ui.theme(prefs.dark());
+        setTheme(Ui.themeRes(prefs.dark()));
+        super.onCreate(saved);
+        Store.load(this);
+        eng = Engine.get(this);
+        setContentView(build());
+        Ui.applyWindow(this);
+        refresh();
+    }
+
+    @Override protected void onResume() { super.onResume(); bar.attach(); refresh(); }
+    @Override protected void onPause()  { bar.detach(); super.onPause(); }
+
+    private View build() {
+        LinearLayout root = Ui.col(this);
+        root.setBackgroundColor(Ui.BG);
+        root.setFitsSystemWindows(true);
+
+        LinearLayout header = Ui.appBar(this, 0, "Tracks", "", true, null);
+        LinearLayout titles = (LinearLayout) header.getChildAt(1);
+        subtitle = (TextView) titles.getChildAt(1);
+        root.addView(header);
+
+        LinearLayout body = Ui.col(this);
+
+        LinearLayout addCard = Ui.card(this);
+        LinearLayout btns = Ui.row(this);
+        LinearLayout files = Ui.btn(this, "Add files", Ico.PLUS, Ui.PRIMARY, new View.OnClickListener() {
+            public void onClick(View v) { pickFiles(); }
+        });
+        files.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        Ui.margin(this, files, 0, 0, 8, 0);
+        btns.addView(files);
+        LinearLayout folder = Ui.btn(this, "Add folder", Ico.FOLDER, Ui.SECONDARY, new View.OnClickListener() {
+            public void onClick(View v) { pickFolder(); }
+        });
+        folder.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        btns.addView(folder);
+        addCard.addView(btns);
+        TextView hint = Ui.tv(this, "Riola only reads your files. Nothing is copied, moved or changed.",
+                11.5f, Ui.DIM, false);
+        Ui.margin(this, hint, 2, 8, 0, 0);
+        addCard.addView(hint);
+        body.addView(addCard);
+
+        LinearLayout card = Ui.card(this);
+        LinearLayout head = Ui.row(this);
+        LinearLayout hd = Ui.heading(this, Ico.LIST, "In the library");
+        hd.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        head.addView(hd);
+        head.addView(Ui.iconBtn(this, Ico.TRASH, Ui.DIM, 16, "Remove all tracks", new View.OnClickListener() {
+            public void onClick(View v) { clearAll(); }
+        }));
+        card.addView(head);
+        listBox = Ui.col(this);
+        card.addView(listBox);
+        body.addView(card);
+
+        body.addView(Ui.gap(this, 6));
+        root.addView(Ui.scroller(this, body));
+
+        bar = new PlayerBar(this, this);
+        root.addView(bar.view);
+        return root;
+    }
+
+    private void refresh() {
+        int n = Store.LIB.size();
+        subtitle.setText(n == 0 ? "nothing added yet" : (n + (n == 1 ? " track" : " tracks")));
+        listBox.removeAllViews();
+        if (n == 0) {
+            listBox.addView(Ui.emptyState(this, Ico.NOTE, "No tracks yet",
+                    "Add single files, or point Riola at a folder and it will find the audio inside."));
+            return;
+        }
+        for (int i = 0; i < n; i++) listBox.addView(row(i));
+    }
+
+    private View row(final int index) {
+        final Track t = Store.LIB.get(index);
+        boolean live = eng.st.running && eng.st.preview && eng.st.stepTitle.equals(t.shortTitle());
+
         LinearLayout r = Ui.row(this);
         r.setBackground(Ui.ripple(Ui.rr(this, Ui.SURF2, 12)));
-        r.setPadding(Ui.dp(this, 10), Ui.dp(this, 8), Ui.dp(this, 4), Ui.dp(this, 8));
+        r.setPadding(Ui.dp(this, 6), Ui.dp(this, 8), Ui.dp(this, 2), Ui.dp(this, 8));
         Ui.margin(this, r, 0, 0, 0, 6);
 
-        TextView num = Ui.tv(this, String.valueOf(index), 12, Ui.ONACC, true);
-        num.setBackground(Ui.rr(this, Ui.ACC2, 9));
-        num.setPadding(Ui.dp(this, 9), Ui.dp(this, 4), Ui.dp(this, 9), Ui.dp(this, 4));
-        num.setGravity(Gravity.CENTER);
-        r.addView(num);
+        r.addView(Ui.roundBtn(this, live ? Ico.STOP : Ico.PLAY, 16, false, "Preview", new View.OnClickListener() {
+            public void onClick(View v) {
+                Ui.buzz(v);
+                if (eng.isRunning()) { bar.stop(); }
+                else { eng.previewTrack(t); PlayerBar.startService(LibraryActivity.this); }
+                refresh();
+            }
+        }));
+        r.addView(Ui.hgap(this, 6));
 
-        LinearLayout mid = Ui.col(this);
-        mid.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
-        Ui.margin(this, mid, 10, 0, 6, 0);
+        LinearLayout col = Ui.col(this);
+        col.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
         TextView title = Ui.tv(this, t.shortTitle(), 14, Ui.TXT, false);
         Ui.ellipsize(title);
-        mid.addView(title);
-        mid.addView(Ui.tv(this, t.durMs > 0 ? Fmt.ms(t.durMs) : "length unknown", 11, Ui.DIM, false));
-        r.addView(mid);
+        col.addView(title);
+        col.addView(Ui.tv(this, (t.durMs > 0 ? Fmt.ms(t.durMs) : "length unknown") + usage(t),
+                11, Ui.DIM, false));
+        r.addView(col);
 
-        r.addView(Ui.iconBtn(this, Ico.PLAY, Ui.ACC, 16, new View.OnClickListener() {
-            public void onClick(View v) { previewTrack(index); }
+        r.addView(Ui.iconBtn(this, Ico.MORE, Ui.DIM, 16, "Track options", new View.OnClickListener() {
+            public void onClick(View v) { menu(index); }
         }));
-        r.addView(Ui.iconBtn(this, Ico.AB, Ui.ACC, 16, new View.OnClickListener() {
-            public void onClick(View v) { AbDialog.show(MainActivity.this, index, new AbDialog.OnInsert() {
-                public void insert(String line) { insertLine(line); }
-            }); }
-        }));
-        r.addView(Ui.iconBtn(this, Ico.LIST, Ui.DIM, 16, new View.OnClickListener() {
-            public void onClick(View v) { trackMenu(index); }
-        }));
-
-        r.setOnLongClickListener(new View.OnLongClickListener() {
-            public boolean onLongClick(View v) { trackMenu(index); return true; }
+        r.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { menu(index); }
         });
         return r;
     }
 
-    private void trackMenu(final int index) {
+    private String usage(Track t) {
+        int n = 0;
+        for (Program p : Store.PROGRAMS) {
+            for (int i = 0; i < p.steps.size(); i++) {
+                if (t.uri.equals(p.steps.get(i).trackUri)) { n++; break; }
+            }
+        }
+        return n == 0 ? "" : ("  .  used in " + n + (n == 1 ? " program" : " programs"));
+    }
+
+    private void menu(final int index) {
         if (index < 0 || index >= Store.LIB.size()) return;
         final Track t = Store.LIB.get(index);
-        final String[] items = {
-                "Insert  PLAY " + index,
-                "Insert  SECTION " + index + " 0:00 0:30",
-                "Pick an A-B section by ear",
-                "Move up", "Move down", "Remove from library"
-        };
-        dialog().setTitle(t.shortTitle()).setItems(items, new android.content.DialogInterface.OnClickListener() {
-            public void onClick(android.content.DialogInterface d, int which) {
+        final String[] items = { "Preview", "Rename", "Move up", "Move down", "Remove from library" };
+        Ui.dialog(this).setTitle(t.shortTitle()).setItems(items, new DialogInterface.OnClickListener() {
+            public void onClick(DialogInterface d, int which) {
                 switch (which) {
-                    case 0: insertLine("PLAY " + index); break;
-                    case 1: insertLine("SECTION " + index + " 0:00 0:30 x2"); break;
-                    case 2: AbDialog.show(MainActivity.this, index, new AbDialog.OnInsert() {
-                                public void insert(String line) { insertLine(line); }
-                            }); break;
-                    case 3: move(index, -1); break;
-                    case 4: move(index, 1); break;
-                    default: remove(index); break;
+                    case 0:
+                        eng.previewTrack(t);
+                        PlayerBar.startService(LibraryActivity.this);
+                        refresh();
+                        break;
+                    case 1:
+                        Pickers.text(LibraryActivity.this, "Rename track", t.shortTitle(), "name",
+                                new Pickers.OnText() {
+                            public void picked(String s) {
+                                t.title = s;
+                                Store.saveLib(LibraryActivity.this);
+                                refresh();
+                            }
+                        });
+                        break;
+                    case 2: move(index, -1); break;
+                    case 3: move(index, 1); break;
+                    default: remove(index, t);
                 }
             }
         }).show();
@@ -2554,446 +4247,42 @@ public class MainActivity extends Activity implements Engine.Listener {
         Store.LIB.set(index, Store.LIB.get(to));
         Store.LIB.set(to, a);
         Store.saveLib(this);
-        refreshTracks();
-        toast("Track numbers changed - check your program");
+        refresh();
     }
 
-    private void remove(int index) {
-        if (index < 0 || index >= Store.LIB.size()) return;
-        Store.LIB.remove(index);
-        Store.saveLib(this);
-        refreshTracks();
-        validate(false);
-    }
-
-    private void confirmClearLibrary() {
-        if (Store.LIB.isEmpty()) return;
-        dialog().setTitle("Clear the library?")
-                .setMessage("This removes every track from Riola. Your files are not touched.")
+    private void remove(final int index, final Track t) {
+        String extra = usage(t);
+        Ui.dialog(this).setTitle("Remove " + t.shortTitle() + "?")
+                .setMessage(extra.length() == 0
+                        ? "The file on your phone is not touched."
+                        : ("This track is" + extra.replace("  .  used", " used")
+                           + ". Those steps will be marked missing and skipped.\n\nThe file itself is not touched."))
                 .setNegativeButton("Cancel", null)
-                .setPositiveButton("Clear", new android.content.DialogInterface.OnClickListener() {
-                    public void onClick(android.content.DialogInterface d, int w) {
-                        Store.LIB.clear();
-                        Store.saveLib(MainActivity.this);
-                        refreshTracks();
-                        validate(false);
+                .setPositiveButton("Remove", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) {
+                        Store.LIB.remove(index);
+                        Store.saveLib(LibraryActivity.this);
+                        refresh();
                     }
                 }).show();
     }
 
-    // ---- program ---------------------------------------------------------
-    private View programCard() {
-        LinearLayout c = Ui.card(this);
-        c.addView(Ui.heading(this, Ico.EDIT, "Program"));
-
-        HorizontalScrollView hs = new HorizontalScrollView(this);
-        hs.setHorizontalScrollBarEnabled(false);
-        hs.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
-        LinearLayout chips = Ui.row(this);
-        chips.addView(snippet("PLAY", "PLAY 0 2 TIMES"));
-        chips.addView(snippet("SECTION", "SECTION 0 0:30 1:15 FOR 10 MIN"));
-        chips.addView(snippet("PAUSE", "PAUSE 5 MIN"));
-        chips.addView(snippet("LOOP", "LOOP 0 FOR 15 MIN"));
-        chips.addView(snippet("REPEAT", "REPEAT 3"));
-        chips.addView(snippet("END", "END"));
-        chips.addView(snippet("SPEED", "SPEED 1.0"));
-        chips.addView(snippet("VOLUME", "VOLUME 80"));
-        chips.addView(snippet("#", "# note to self"));
-        hs.addView(chips, new FrameLayout.LayoutParams(Ui.WRAP, Ui.WRAP));
-        c.addView(hs);
-
-        editor = new EditText(this);
-        editor.setTypeface(Typeface.MONOSPACE);
-        editor.setTextSize(13);
-        editor.setTextColor(Ui.TXT);
-        editor.setHintTextColor(Ui.DIM);
-        editor.setHint("PLAY 0\nSECTION 0 0:30 1:15 FOR 10 MIN\nPAUSE 2 MIN");
-        editor.setGravity(Gravity.TOP | Gravity.START);
-        editor.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
-                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS);
-        editor.setMinLines(6);
-        editor.setBackground(Ui.rrs(this, Ui.dark ? 0xFF0B0F14 : 0xFFF8FAFC, Ui.LINE, 12, 1));
-        int p = Ui.dp(this, 12);
-        editor.setPadding(p, p, p, p);
-        editor.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
-        Ui.margin(this, editor, 0, 6, 0, 0);
-        editor.addTextChangedListener(new TextWatcher() {
-            public void beforeTextChanged(CharSequence s, int a, int b, int c) { }
-            public void onTextChanged(CharSequence s, int a, int b, int c) { }
-            public void afterTextChanged(Editable e) { scheduleValidate(); }
-        });
-        c.addView(editor);
-
-        validateMsg = Ui.tv(this, "", 12, Ui.DIM, false);
-        Ui.margin(this, validateMsg, 2, 8, 0, 0);
-        c.addView(validateMsg);
-
-        LinearLayout btns = Ui.row(this);
-        Ui.margin(this, btns, 0, 10, 0, 0);
-        btns.addView(spaced(Ui.btn(this, "Check", Ico.CHECK, Ui.SECONDARY, new View.OnClickListener() {
-            public void onClick(View v) { validate(true); }
-        })));
-        btns.addView(spaced(Ui.btn(this, "Save", Ico.SAVE, Ui.SECONDARY, new View.OnClickListener() {
-            public void onClick(View v) { saveDialog(); }
-        })));
-        btns.addView(spaced(Ui.btn(this, "Load", Ico.OPEN, Ui.SECONDARY, new View.OnClickListener() {
-            public void onClick(View v) { loadDialog(); }
-        })));
-        View spring = new View(this);
-        spring.setLayoutParams(Ui.lpw(0, 1, 1f));
-        btns.addView(spring);
-        btns.addView(Ui.btn(this, "Clear", 0, Ui.GHOST, new View.OnClickListener() {
-            public void onClick(View v) {
-                dialog().setTitle("Clear the program text?")
-                        .setNegativeButton("Cancel", null)
-                        .setPositiveButton("Clear", new android.content.DialogInterface.OnClickListener() {
-                            public void onClick(android.content.DialogInterface d, int w) {
-                                editor.setText("");
-                                validate(false);
-                            }
-                        }).show();
-            }
-        }));
-        c.addView(btns);
-        return c;
-    }
-
-    private View spaced(View v) {
-        Ui.margin(this, v, 0, 0, 8, 0);
-        return v;
-    }
-
-    private View snippet(String label, final String text) {
-        return Ui.chip(this, label, new View.OnClickListener() {
-            public void onClick(View v) { insertLine(text); }
-        });
-    }
-
-    private void insertLine(String line) {
-        Editable e = editor.getText();
-        String cur = e.toString();
-        int at = Math.max(0, Math.min(editor.getSelectionStart(), cur.length()));
-        int lineEnd = cur.indexOf('\n', at);
-        if (lineEnd < 0) lineEnd = cur.length();
-        String ins = (cur.trim().length() == 0) ? line + "\n" : "\n" + line;
-        e.insert(lineEnd, ins);
-        editor.setSelection(Math.min(e.length(), lineEnd + ins.length()));
-        editor.requestFocus();
-        scheduleValidate();
-    }
-
-    private void scheduleValidate() {
-        if (pendingValidate != null) ui.removeCallbacks(pendingValidate);
-        pendingValidate = new Runnable() {
-            public void run() {
-                if (prefs.autoSave()) Store.script(MainActivity.this, editor.getText().toString());
-                validate(false);
-            }
-        };
-        ui.postDelayed(pendingValidate, 500);
-    }
-
-    private Parser.Result validate(boolean loud) {
-        Parser.Result r = Parser.parse(editor.getText().toString(), Store.LIB.size());
-        if (r.cmds.isEmpty() && r.errors.isEmpty()) {
-            validateMsg.setTextColor(Ui.DIM);
-            validateMsg.setText("Empty program. Tap a chip above or the ? in the corner.");
-        } else if (r.ok()) {
-            validateMsg.setTextColor(Ui.GREEN);
-            validateMsg.setText("Looks good: " + r.cmds.size() + " step(s), about " + Fmt.human(r.estMs()) + ".");
-        } else {
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < r.errors.size() && i < 6; i++) {
-                if (i > 0) sb.append('\n');
-                sb.append(r.errors.get(i));
-            }
-            if (r.errors.size() > 6) sb.append("\n...and ").append(r.errors.size() - 6).append(" more.");
-            validateMsg.setTextColor(Ui.RED);
-            validateMsg.setText(sb.toString());
-        }
-        showSteps(r.ok() ? r.cmds : new ArrayList<Cmd>());
-        if (loud) toast(r.ok() ? "Program is valid" : (r.errors.size() + " problem(s) found"));
-        return r;
-    }
-
-    // ---- steps -----------------------------------------------------------
-    private LinearLayout stepsCard() {
-        LinearLayout c = Ui.card(this);
-        LinearLayout head = Ui.row(this);
-        LinearLayout hd = Ui.heading(this, Ico.CLOCK, "Steps");
-        hd.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
-        head.addView(hd);
-        stepsCount = Ui.badge(this, "", Ui.DIM, Ui.SURF2);
-        head.addView(stepsCount);
-        c.addView(head);
-        stepsBox = Ui.col(this);
-        c.addView(stepsBox);
-        c.setVisibility(View.GONE);
-        return c;
-    }
-
-    private void showSteps(List<Cmd> cmds) {
-        stepsBox.removeAllViews();
-        stepRows.clear();
-        if (cmds.isEmpty()) {
-            stepsCard.setVisibility(View.GONE);
-            return;
-        }
-        stepsCard.setVisibility(View.VISIBLE);
-        stepsCount.setText(cmds.size() + " steps  -  " + Fmt.human(estimate(cmds)));
-        int limit = Math.min(cmds.size(), 60);
-        for (int i = 0; i < limit; i++) {
-            final int index = i;
-            Cmd cmd = cmds.get(i);
-            LinearLayout r = Ui.row(this);
-            r.setPadding(Ui.dp(this, 8), Ui.dp(this, 7), Ui.dp(this, 8), Ui.dp(this, 7));
-            r.setBackground(Ui.ripple(Ui.rr(this, 0x00000000, 10)));
-            Ui.margin(this, r, 0, 0, 0, 2);
-            TextView num = Ui.mono(this, pad(i + 1), 11, Ui.DIM);
-            r.addView(num);
-            TextView lbl = Ui.tv(this, cmd.label(), 12.5f, Ui.TXT, false);
-            Ui.ellipsize(lbl);
-            lbl.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
-            Ui.margin(this, lbl, 10, 0, 0, 0);
-            r.addView(lbl);
-            r.setOnClickListener(new View.OnClickListener() {
-                public void onClick(View v) {
-                    if (eng.isRunning()) eng.jumpTo(index);
-                    else runProgram(index);
-                }
-            });
-            stepRows.add(r);
-            stepsBox.addView(r);
-        }
-        if (cmds.size() > limit) {
-            stepsBox.addView(Ui.tv(this, "...and " + (cmds.size() - limit) + " more steps", 11, Ui.DIM, false));
-        }
-    }
-
-    private String pad(int n) {
-        String s = String.valueOf(n);
-        while (s.length() < 3) s = " " + s;
-        return s;
-    }
-
-    private long estimate(List<Cmd> cmds) {
-        long t = 0;
-        for (int i = 0; i < cmds.size(); i++) t += cmds.get(i).estMs();
-        return t;
-    }
-
-    private void highlight(int active) {
-        for (int i = 0; i < stepRows.size(); i++) {
-            View v = stepRows.get(i);
-            if (i == active) v.setBackground(Ui.rrs(this, Ui.dark ? 0xFF10202B : 0xFFE3F2FB, Ui.ACC, 10, 1));
-            else v.setBackground(Ui.ripple(Ui.rr(this, 0x00000000, 10)));
-        }
-    }
-
-    // ---- log -------------------------------------------------------------
-    private LinearLayout logCard() {
-        LinearLayout c = Ui.card(this);
-        LinearLayout head = Ui.row(this);
-        LinearLayout hd = Ui.heading(this, Ico.WAVE, "Activity");
-        hd.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
-        head.addView(hd);
-        head.addView(Ui.iconBtn(this, Ico.CLOSE, Ui.DIM, 14, new View.OnClickListener() {
-            public void onClick(View v) { eng.clearLog(); logView.setText(""); }
-        }));
-        c.addView(head);
-
-        logScroll = new ScrollView(this);
-        logScroll.setLayoutParams(Ui.lp(Ui.MATCH, Ui.dp(this, 132)));
-        logView = Ui.mono(this, "", 11, Ui.DIM);
-        logScroll.addView(logView, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
-        c.addView(logScroll);
-        return c;
-    }
-
-    private void appendLog(String line) {
-        logView.append(line + "\n");
-        logScroll.post(new Runnable() {
-            public void run() { logScroll.fullScroll(View.FOCUS_DOWN); }
-        });
-    }
-
-    // ---- transport -------------------------------------------------------
-    private View transportBar() {
-        LinearLayout wrap = Ui.col(this);
-        wrap.setBackgroundColor(Ui.SURF);
-        View top = new View(this);
-        top.setLayoutParams(Ui.lp(Ui.MATCH, Math.max(1, Ui.dp(this, 0.7f))));
-        top.setBackgroundColor(Ui.LINE);
-        wrap.addView(top);
-
-        LinearLayout inner = Ui.col(this);
-        inner.setPadding(Ui.dp(this, 14), Ui.dp(this, 10), Ui.dp(this, 14), Ui.dp(this, 12));
-        wrap.addView(inner);
-
-        // idle
-        idleBar = Ui.col(this);
-        LinearLayout run = Ui.btn(this, "RUN PROGRAM", Ico.PLAY, Ui.PRIMARY, new View.OnClickListener() {
-            public void onClick(View v) { runProgram(0); }
-        });
-        run.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
-        idleBar.addView(run);
-        inner.addView(idleBar);
-
-        // running
-        playBar = Ui.col(this);
-        playBar.setVisibility(View.GONE);
-
-        LinearLayout line1 = Ui.row(this);
-        npTitle = Ui.tv(this, "", 14, Ui.TXT, true);
-        Ui.ellipsize(npTitle);
-        npTitle.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
-        line1.addView(npTitle);
-        npBadge = Ui.badge(this, "", Ui.ONACC, Ui.ACC);
-        line1.addView(npBadge);
-        playBar.addView(line1);
-
-        npStep = Ui.tv(this, "", 12, Ui.DIM, false);
-        Ui.ellipsize(npStep);
-        Ui.margin(this, npStep, 0, 2, 0, 0);
-        playBar.addView(npStep);
-
-        seek = new SeekBar(this);
-        seek.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
-        seek.setProgressTintList(ColorStateList.valueOf(Ui.ACC));
-        seek.setThumbTintList(ColorStateList.valueOf(Ui.ACC));
-        seek.setProgressBackgroundTintList(ColorStateList.valueOf(Ui.LINE));
-        seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            public void onProgressChanged(SeekBar s, int p, boolean fromUser) { }
-            public void onStartTrackingTouch(SeekBar s) { dragging = true; }
-            public void onStopTrackingTouch(SeekBar s) { dragging = false; eng.seekTo(s.getProgress()); }
-        });
-        Ui.margin(this, seek, 0, 4, 0, 0);
-        playBar.addView(seek);
-
-        LinearLayout line3 = Ui.row(this);
-        npTime = Ui.mono(this, "0:00 / 0:00", 11, Ui.DIM);
-        line3.addView(npTime);
-        View spring = new View(this);
-        spring.setLayoutParams(Ui.lpw(0, 1, 1f));
-        line3.addView(spring);
-        npRemain = Ui.tv(this, "", 11, Ui.DIM, false);
-        line3.addView(npRemain);
-        playBar.addView(line3);
-
-        LinearLayout tr = Ui.row(this);
-        tr.setGravity(Gravity.CENTER);
-        Ui.margin(this, tr, 0, 6, 0, 0);
-        tr.addView(Ui.roundBtn(this, Ico.PREV, 20, false, new View.OnClickListener() {
-            public void onClick(View v) { eng.prev(); }
-        }));
-        tr.addView(gapH(10));
-        btnPlay = Ui.roundBtn(this, Ico.PAUSE, 22, true, new View.OnClickListener() {
-            public void onClick(View v) { eng.togglePause(); }
-        });
-        tr.addView(btnPlay);
-        tr.addView(gapH(10));
-        tr.addView(Ui.roundBtn(this, Ico.STOP, 20, false, new View.OnClickListener() {
-            public void onClick(View v) { stopProgram(); }
-        }));
-        tr.addView(gapH(10));
-        tr.addView(Ui.roundBtn(this, Ico.NEXT, 20, false, new View.OnClickListener() {
-            public void onClick(View v) { eng.next(); }
-        }));
-        playBar.addView(tr);
-
-        inner.addView(playBar);
-        return wrap;
-    }
-
-    private View gapH(int w) {
-        View v = new View(this);
-        v.setLayoutParams(Ui.lp(Ui.dp(this, w), 1));
-        return v;
+    private void clearAll() {
+        if (Store.LIB.isEmpty()) return;
+        Ui.dialog(this).setTitle("Remove every track?")
+                .setMessage("Programs keep their steps but they will have nothing to play. Your files are untouched.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Remove all", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) {
+                        Store.LIB.clear();
+                        Store.saveLib(LibraryActivity.this);
+                        refresh();
+                    }
+                }).show();
     }
 
     // ======================================================================
-    // running a program
-    // ======================================================================
-    private void runProgram(int from) {
-        Store.script(this, editor.getText().toString());
-        Parser.Result r = validate(false);
-        if (r.cmds.isEmpty()) {
-            toast(r.errors.isEmpty() ? "Write a program first" : "Fix the errors first");
-            return;
-        }
-        if (!r.ok()) { toast("Fix the errors first"); return; }
-        if (Store.LIB.isEmpty()) { toast("Add some tracks first"); return; }
-        askNotificationPermission();
-        eng.start(r.cmds, from);
-        startPlaybackService();
-    }
-
-    private void previewTrack(int index) {
-        askNotificationPermission();
-        eng.preview(index);
-        startPlaybackService();
-    }
-
-    private void startPlaybackService() {
-        Intent i = new Intent(this, PlayerService.class).setAction(PlayerService.ACT_ATTACH);
-        try { startForegroundService(i); }
-        catch (Exception e) { startService(i); }
-    }
-
-    private void stopProgram() {
-        eng.stop();
-        // The engine tells the service it is done; this is only a safety net so
-        // a stray notification can never outlive the playback.
-        try { stopService(new Intent(this, PlayerService.class)); }
-        catch (Exception e) { /* the service already went away */ }
-        render(eng.st);
-    }
-
-    private void askNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= 33
-                && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{ "android.permission.POST_NOTIFICATIONS" }, REQ_NOTIF);
-        }
-    }
-
-    // ---- engine callbacks ------------------------------------------------
-    public void onState(Engine.St s) { render(s); }
-
-    public void onLog(String line) { appendLog(line); }
-
-    public void onFinished(boolean completed) {
-        render(eng.st);
-        toast(completed ? "Program finished" : "Playback stopped");
-    }
-
-    private void render(Engine.St s) {
-        boolean run = s.running;
-        idleBar.setVisibility(run ? View.GONE : View.VISIBLE);
-        playBar.setVisibility(run ? View.VISIBLE : View.GONE);
-        if (!run) { highlight(-1); return; }
-
-        npTitle.setText(s.trackTitle);
-        npStep.setText(s.stepText);
-        npBadge.setText(s.preview ? "PREVIEW" : ("STEP " + (s.step + 1) + "/" + s.steps));
-        int max = Math.max(1, s.durMs);
-        if (!dragging) {
-            seek.setMax(max);
-            seek.setProgress(Math.min(s.posMs, max));
-        }
-        npTime.setText(Fmt.ms(s.posMs) + " / " + Fmt.ms(s.durMs));
-
-        String right = "";
-        if (s.stepRemainMs >= 0) right = Fmt.human(s.stepRemainMs) + " left";
-        else if (s.repTotal > 0) right = "pass " + Math.min(s.repDone + 1, s.repTotal) + " of " + s.repTotal;
-        if (s.progRemainMs > 0) right = right + (right.length() == 0 ? "" : "  -  ") + "~" + Fmt.human(s.progRemainMs) + " to go";
-        npRemain.setText(right);
-
-        Ui.setIcon(btnPlay, s.paused ? Ico.PLAY : Ico.PAUSE, Ui.ONACC);
-        highlight(s.preview ? -1 : s.step);
-    }
-
-    // ======================================================================
-    // picking files
+    // adding files
     // ======================================================================
     private void pickFiles() {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -3003,14 +4292,14 @@ public class MainActivity extends Activity implements Engine.Listener {
         i.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{ "audio/*", "application/ogg", "application/x-ogg" });
         i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         try { startActivityForResult(i, REQ_FILES); }
-        catch (Exception e) { toast("No file picker on this device"); }
+        catch (Exception e) { Ui.toast(this, "No file picker on this device"); }
     }
 
     private void pickFolder() {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
         i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         try { startActivityForResult(i, REQ_TREE); }
-        catch (Exception e) { toast("No folder picker on this device"); }
+        catch (Exception e) { Ui.toast(this, "No folder picker on this device"); }
     }
 
     @Override
@@ -3026,7 +4315,7 @@ public class MainActivity extends Activity implements Engine.Listener {
             int added = 0;
             for (Uri u : uris) {
                 persist(u);
-                if (addTrack(u, displayName(u))) added++;
+                if (add(u, displayName(u))) added++;
             }
             finishAdding(added);
 
@@ -3039,23 +4328,21 @@ public class MainActivity extends Activity implements Engine.Listener {
     }
 
     private void persist(Uri u) {
-        try {
-            getContentResolver().takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        } catch (Exception e) { /* some providers do not offer persistable grants */ }
+        try { getContentResolver().takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION); }
+        catch (Exception e) { /* some providers do not offer persistable grants */ }
     }
 
-    private boolean addTrack(Uri u, String name) {
+    private boolean add(Uri u, String name) {
         String s = u.toString();
-        for (Track t : Store.LIB) if (t.uri.equals(s)) return false;
+        if (Store.byUri(s) != null) return false;
         Store.LIB.add(new Track(s, name, 0));
         return true;
     }
 
     private void finishAdding(int added) {
         Store.saveLib(this);
-        refreshTracks();
-        validate(false);
-        toast(added == 0 ? "Nothing new was added" : (added + " track(s) added"));
+        refresh();
+        Ui.toast(this, added == 0 ? "Nothing new was added" : (added + (added == 1 ? " track added" : " tracks added")));
         readDurations();
     }
 
@@ -3074,18 +4361,17 @@ public class MainActivity extends Activity implements Engine.Listener {
     }
 
     private void scanFolder(final Uri tree) {
-        toast("Scanning folder...");
+        Ui.toast(this, "Scanning folder...");
         new Thread(new Runnable() {
             public void run() {
                 final List<Track> found = new ArrayList<Track>();
-                try {
-                    collect(tree, DocumentsContract.getTreeDocumentId(tree), found, 0);
-                } catch (Exception e) { /* partial results are fine */ }
+                try { collect(tree, DocumentsContract.getTreeDocumentId(tree), found, 0); }
+                catch (Exception e) { /* partial results are fine */ }
                 Collections.sort(found, new Comparator<Track>() {
                     public int compare(Track a, Track b) { return a.title.compareToIgnoreCase(b.title); }
                 });
                 final int[] added = { 0 };
-                for (Track t : found) if (addTrack(Uri.parse(t.uri), t.title)) added[0]++;
+                for (Track t : found) if (add(Uri.parse(t.uri), t.title)) added[0]++;
                 runOnUiThread(new Runnable() {
                     public void run() { finishAdding(added[0]); }
                 });
@@ -3131,207 +4417,25 @@ public class MainActivity extends Activity implements Engine.Listener {
                     if (t.durMs > 0) continue;
                     MediaMetadataRetriever mmr = new MediaMetadataRetriever();
                     try {
-                        mmr.setDataSource(MainActivity.this, t.toUri());
+                        mmr.setDataSource(LibraryActivity.this, t.toUri());
                         String d = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
                         if (d != null) { t.durMs = Long.parseLong(d); changed = true; }
                     } catch (Exception e) { /* unreadable file */ }
                     finally { try { mmr.release(); } catch (Exception e) { } }
                 }
                 if (!changed) return;
-                Store.saveLib(MainActivity.this);
+                Store.saveLib(LibraryActivity.this);
                 runOnUiThread(new Runnable() {
-                    public void run() { refreshTracks(); validate(false); }
+                    public void run() { refresh(); }
                 });
             }
         }).start();
     }
 
-    // ======================================================================
-    // dialogs
-    // ======================================================================
-    private AlertDialog.Builder dialog() {
-        return new AlertDialog.Builder(this, Ui.dark ? android.R.style.Theme_Material_Dialog_Alert
-                                                     : android.R.style.Theme_Material_Light_Dialog_Alert);
-    }
+    // ---- engine callbacks ------------------------------------------------
+    public void onEngineState(Engine.St s) { }
 
-    private void helpDialog() {
-        ScrollView sv = new ScrollView(this);
-        TextView t = Ui.mono(this, HelpText.TEXT, 11, Ui.TXT);
-        int p = Ui.dp(this, 16);
-        t.setPadding(p, p, p, p);
-        t.setTextIsSelectable(true);
-        sv.addView(t, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
-        dialog().setTitle("Script reference").setView(sv).setPositiveButton("Close", null).show();
-    }
-
-    private void saveDialog() {
-        final EditText in = new EditText(this);
-        in.setHint("name for this program");
-        in.setSingleLine(true);
-        int p = Ui.dp(this, 20);
-        LinearLayout box = Ui.col(this);
-        box.setPadding(p, Ui.dp(this, 8), p, 0);
-        box.addView(in);
-        dialog().setTitle("Save program").setView(box)
-                .setNegativeButton("Cancel", null)
-                .setPositiveButton("Save", new android.content.DialogInterface.OnClickListener() {
-                    public void onClick(android.content.DialogInterface d, int w) {
-                        String name = in.getText().toString().trim();
-                        if (name.length() == 0) { toast("Give it a name"); return; }
-                        Store.saveProgram(MainActivity.this, name, editor.getText().toString());
-                        toast("Saved as " + name);
-                    }
-                }).show();
-    }
-
-    private void loadDialog() {
-        final List<String> names = Store.programNames(this);
-        if (names.isEmpty()) { toast("Nothing saved yet"); return; }
-        LinearLayout box = Ui.col(this);
-        int p = Ui.dp(this, 12);
-        box.setPadding(p, p, p, p);
-        final AlertDialog[] holder = new AlertDialog[1];
-        for (int i = 0; i < names.size(); i++) {
-            final String name = names.get(i);
-            LinearLayout r = Ui.row(this);
-            r.setBackground(Ui.ripple(Ui.rr(this, Ui.SURF2, 10)));
-            r.setPadding(Ui.dp(this, 12), Ui.dp(this, 10), Ui.dp(this, 4), Ui.dp(this, 10));
-            Ui.margin(this, r, 0, 0, 0, 6);
-            TextView t = Ui.tv(this, name, 14, Ui.TXT, false);
-            t.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
-            Ui.ellipsize(t);
-            r.addView(t);
-            r.addView(Ui.iconBtn(this, Ico.TRASH, Ui.DIM, 16, new View.OnClickListener() {
-                public void onClick(View v) {
-                    Store.deleteProgram(MainActivity.this, name);
-                    if (holder[0] != null) holder[0].dismiss();
-                    toast("Deleted " + name);
-                }
-            }));
-            r.setOnClickListener(new View.OnClickListener() {
-                public void onClick(View v) {
-                    editor.setText(Store.program(MainActivity.this, name));
-                    validate(false);
-                    if (holder[0] != null) holder[0].dismiss();
-                    toast("Loaded " + name);
-                }
-            });
-            box.addView(r);
-        }
-        ScrollView sv = new ScrollView(this);
-        sv.addView(box, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
-        holder[0] = dialog().setTitle("Saved programs").setView(sv).setNegativeButton("Close", null).create();
-        holder[0].show();
-    }
-
-    private void settingsDialog() {
-        LinearLayout box = Ui.col(this);
-        int p = Ui.dp(this, 18);
-        box.setPadding(p, Ui.dp(this, 6), p, 0);
-
-        box.addView(switchRow("Dark theme", prefs.dark(), new OnToggle() {
-            public void set(boolean v) { prefs.dark(v); recreate(); }
-        }));
-        box.addView(switchRow("Keep the screen on", prefs.keepScreenOn(), new OnToggle() {
-            public void set(boolean v) {
-                prefs.keepScreenOn(v);
-                if (v) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-            }
-        }));
-        box.addView(switchRow("Hold the CPU awake while a program runs", prefs.wakeLock(), new OnToggle() {
-            public void set(boolean v) { prefs.wakeLock(v); }
-        }));
-        box.addView(switchRow("Pause when headphones are unplugged", prefs.pauseUnplug(), new OnToggle() {
-            public void set(boolean v) { prefs.pauseUnplug(v); }
-        }));
-        box.addView(switchRow("Pause for calls and other apps", prefs.pauseOnFocus(), new OnToggle() {
-            public void set(boolean v) { prefs.pauseOnFocus(v); }
-        }));
-        box.addView(switchRow("Save the program text automatically", prefs.autoSave(), new OnToggle() {
-            public void set(boolean v) { prefs.autoSave(v); }
-        }));
-        box.addView(switchRow("Show the activity log", prefs.showLog(), new OnToggle() {
-            public void set(boolean v) {
-                prefs.showLog(v);
-                logCard.setVisibility(v ? View.VISIBLE : View.GONE);
-            }
-        }));
-
-        box.addView(Ui.divider(this));
-        box.addView(sliderRow("Master volume", 0, 100, prefs.volume(), "%", new OnSlide() {
-            public void set(int v) { prefs.volume(v); eng.setMasterVolume(v); }
-        }));
-        box.addView(sliderRow("Playback speed", 50, 200, prefs.speedPct(), "%", new OnSlide() {
-            public void set(int v) { prefs.speedPct(v); eng.setMasterSpeed(v); }
-        }));
-        box.addView(sliderRow("Fade at loop edges", 0, 1000, prefs.fadeMs(), " ms", new OnSlide() {
-            public void set(int v) { prefs.fadeMs(v); }
-        }));
-
-        box.addView(Ui.divider(this));
-        box.addView(Ui.btn(this, "Reset settings to defaults", 0, Ui.DANGER, new View.OnClickListener() {
-            public void onClick(View v) {
-                prefs.resetAll();
-                toast("Settings reset");
-                recreate();
-            }
-        }));
-        box.addView(Ui.gap(this, 6));
-        box.addView(Ui.tv(this, "Riola 3.0  -  no ads, no network, no accounts.", 11, Ui.DIM, false));
-        box.addView(Ui.gap(this, 6));
-
-        ScrollView sv = new ScrollView(this);
-        sv.addView(box, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
-        dialog().setTitle("Settings").setView(sv).setPositiveButton("Done", null).show();
-    }
-
-    private interface OnToggle { void set(boolean v); }
-    private interface OnSlide  { void set(int v); }
-
-    private View switchRow(String label, boolean value, final OnToggle cb) {
-        LinearLayout r = Ui.row(this);
-        Ui.margin(this, r, 0, 4, 0, 4);
-        TextView t = Ui.tv(this, label, 14, Ui.TXT, false);
-        t.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
-        r.addView(t);
-        Switch s = new Switch(this);
-        s.setChecked(value);
-        s.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
-            public void onCheckedChanged(android.widget.CompoundButton b, boolean v) { cb.set(v); }
-        });
-        r.addView(s);
-        return r;
-    }
-
-    private View sliderRow(String label, final int min, int max, int value, final String unit, final OnSlide cb) {
-        LinearLayout c = Ui.col(this);
-        Ui.margin(this, c, 0, 6, 0, 2);
-        LinearLayout head = Ui.row(this);
-        TextView t = Ui.tv(this, label, 14, Ui.TXT, false);
-        t.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
-        head.addView(t);
-        final TextView val = Ui.mono(this, value + unit, 12, Ui.ACC);
-        head.addView(val);
-        c.addView(head);
-        SeekBar s = new SeekBar(this);
-        s.setMax(max - min);
-        s.setProgress(Math.max(0, value - min));
-        s.setProgressTintList(ColorStateList.valueOf(Ui.ACC));
-        s.setThumbTintList(ColorStateList.valueOf(Ui.ACC));
-        s.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
-        s.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            public void onProgressChanged(SeekBar b, int p, boolean fromUser) {
-                val.setText((min + p) + unit);
-            }
-            public void onStartTrackingTouch(SeekBar b) { }
-            public void onStopTrackingTouch(SeekBar b) { cb.set(min + b.getProgress()); }
-        });
-        c.addView(s);
-        return c;
-    }
-
-    private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show(); }
+    public void onEngineFinished(boolean completed) { refresh(); }
 }
 '@
 
@@ -3349,10 +4453,8 @@ import android.media.AudioAttributes;
 import android.media.MediaPlayer;
 import android.os.Handler;
 import android.os.Looper;
-import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
-import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -3360,27 +4462,22 @@ import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.Switch;
 import android.widget.TextView;
-import android.widget.Toast;
 
-/**
- * Listen to the track, mark A and B by ear, then drop a ready made SECTION
- * line into the program.
- */
+/** Listen to the track and mark A and B by ear. */
 public final class AbDialog {
 
-    public interface OnInsert { void insert(String line); }
+    public interface OnPick { void picked(long a, long b); }
 
     private AbDialog() { }
 
-    public static void show(final Activity act, final int index, final OnInsert cb) {
-        if (index < 0 || index >= Store.LIB.size()) return;
-        final Track track = Store.LIB.get(index);
+    public static void show(final Activity act, final Track track, long startMs, long endMs, final OnPick cb) {
+        if (track == null) return;
 
         final Engine eng = Engine.get(act);
         if (eng.isRunning()) eng.stop();
 
-        final long[] a = { 0 };
-        final long[] b = { -1 };
+        final long[] a = { Math.max(0, startMs) };
+        final long[] b = { endMs };
         final boolean[] ready = { false };
         final boolean[] loopAb = { true };
         final MediaPlayer mp = new MediaPlayer();
@@ -3390,7 +4487,7 @@ public final class AbDialog {
         int p = Ui.dp(act, 18);
         box.setPadding(p, Ui.dp(act, 6), p, 0);
 
-        final TextView clock = Ui.mono(act, "0:00 / 0:00", 13, Ui.ACC);
+        final TextView clock = Ui.mono(act, "0:00 / 0:00", 15, Ui.ACC);
         clock.setGravity(Gravity.CENTER);
         clock.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
         box.addView(clock);
@@ -3401,13 +4498,12 @@ public final class AbDialog {
         bar.setThumbTintList(ColorStateList.valueOf(Ui.ACC));
         box.addView(bar);
 
-        final TextView aTv = Ui.mono(act, "A  0:00", 13, Ui.TXT);
-        final TextView bTv = Ui.mono(act, "B  end", 13, Ui.TXT);
+        final TextView aTv = Ui.mono(act, "A   " + Fmt.ms(a[0]), 14, Ui.TXT);
+        final TextView bTv = Ui.mono(act, "B   " + (b[0] < 0 ? "end" : Fmt.ms(b[0])), 14, Ui.TXT);
 
-        // transport
         LinearLayout tr = Ui.row(act);
         tr.setGravity(Gravity.CENTER);
-        final ImageView play = Ui.roundBtn(act, Ico.PLAY, 20, true, null);
+        final ImageView play = Ui.roundBtn(act, Ico.PLAY, 20, true, "Play", null);
         tr.addView(nudge(act, "-5s", new View.OnClickListener() {
             public void onClick(View v) { seekBy(mp, ready, -5000); }
         }));
@@ -3415,12 +4511,13 @@ public final class AbDialog {
         tr.addView(nudge(act, "+5s", new View.OnClickListener() {
             public void onClick(View v) { seekBy(mp, ready, 5000); }
         }));
-        Ui.margin(act, tr, 0, 6, 0, 6);
+        Ui.margin(act, tr, 0, 8, 0, 6);
         box.addView(tr);
 
         play.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 if (!ready[0]) return;
+                Ui.buzz(v);
                 try {
                     if (mp.isPlaying()) { mp.pause(); Ui.setIcon(play, Ico.PLAY, Ui.ONACC); }
                     else { mp.start(); Ui.setIcon(play, Ico.PAUSE, Ui.ONACC); }
@@ -3428,38 +4525,38 @@ public final class AbDialog {
             }
         });
 
-        // A and B rows
         box.addView(markRow(act, aTv, new View.OnClickListener() {
             public void onClick(View v) {
                 a[0] = position(mp, ready);
                 if (b[0] >= 0 && b[0] <= a[0]) b[0] = -1;
-                aTv.setText("A  " + Fmt.ms(a[0]));
-                bTv.setText("B  " + (b[0] < 0 ? "end" : Fmt.ms(b[0])));
+                aTv.setText("A   " + Fmt.ms(a[0]));
+                bTv.setText("B   " + (b[0] < 0 ? "end" : Fmt.ms(b[0])));
             }
         }, new Nudge() {
             public void by(int ms) {
                 a[0] = Math.max(0, a[0] + ms);
-                aTv.setText("A  " + Fmt.ms(a[0]));
+                if (b[0] >= 0 && a[0] >= b[0]) a[0] = Math.max(0, b[0] - 1000);
+                aTv.setText("A   " + Fmt.ms(a[0]));
             }
         }));
 
         box.addView(markRow(act, bTv, new View.OnClickListener() {
             public void onClick(View v) {
                 long pos = position(mp, ready);
-                if (pos <= a[0]) { toast(act, "B must come after A"); return; }
+                if (pos <= a[0]) { Ui.toast(act, "B has to come after A"); return; }
                 b[0] = pos;
-                bTv.setText("B  " + Fmt.ms(b[0]));
+                bTv.setText("B   " + Fmt.ms(b[0]));
             }
         }, new Nudge() {
             public void by(int ms) {
-                if (b[0] < 0) return;
-                b[0] = Math.max(a[0] + 500, b[0] + ms);
-                bTv.setText("B  " + Fmt.ms(b[0]));
+                if (b[0] < 0) b[0] = position(mp, ready);
+                b[0] = Math.max(a[0] + 1000, b[0] + ms);
+                bTv.setText("B   " + Fmt.ms(b[0]));
             }
         }));
 
-        // loop while auditioning
         LinearLayout loopRow = Ui.row(act);
+        Ui.margin(act, loopRow, 0, 4, 0, 0);
         TextView loopLbl = Ui.tv(act, "Loop A-B while listening", 13, Ui.DIM, false);
         loopLbl.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
         loopRow.addView(loopLbl);
@@ -3471,48 +4568,27 @@ public final class AbDialog {
         loopRow.addView(loopSw);
         box.addView(loopRow);
 
-        box.addView(Ui.divider(act));
-
-        // repeat spec for the generated line
-        LinearLayout spec = Ui.row(act);
-        TextView specLbl = Ui.tv(act, "Repeat", 13, Ui.DIM, false);
-        specLbl.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
-        spec.addView(specLbl);
-        final EditText count = new EditText(act);
-        count.setInputType(InputType.TYPE_CLASS_NUMBER);
-        count.setText("4");
-        count.setSingleLine(true);
-        count.setWidth(Ui.dp(act, 64));
-        count.setGravity(Gravity.CENTER);
-        spec.addView(count);
-        final Switch asMinutes = new Switch(act);
-        asMinutes.setText("minutes");
-        asMinutes.setTextColor(Ui.DIM);
-        spec.addView(asMinutes);
-        box.addView(spec);
-        box.addView(Ui.tv(act, "Off = repeat that many times. On = keep looping for that many minutes.",
-                11, Ui.DIM, false));
-        box.addView(Ui.gap(act, 8));
+        LinearLayout jump = Ui.row(act);
+        jump.addView(Ui.chip(act, "jump to A", false, new View.OnClickListener() {
+            public void onClick(View v) { seekTo(mp, ready, a[0]); }
+        }));
+        jump.addView(Ui.chip(act, "jump to B", false, new View.OnClickListener() {
+            public void onClick(View v) { seekTo(mp, ready, Math.max(0, (b[0] < 0 ? duration(mp, ready) : b[0]) - 3000)); }
+        }));
+        box.addView(jump);
+        box.addView(Ui.gap(act, 4));
 
         ScrollView sv = new ScrollView(act);
         sv.addView(box, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
 
-        AlertDialog.Builder bld = new AlertDialog.Builder(act,
-                Ui.dark ? android.R.style.Theme_Material_Dialog_Alert
-                        : android.R.style.Theme_Material_Light_Dialog_Alert);
-        final AlertDialog dlg = bld.setTitle(track.shortTitle())
+        final AlertDialog dlg = Ui.dialog(act).setTitle(track.shortTitle())
                 .setView(sv)
-                .setNegativeButton("Close", null)
-                .setPositiveButton("Insert line", new DialogInterface.OnClickListener() {
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Use this section", new DialogInterface.OnClickListener() {
                     public void onClick(DialogInterface d, int w) {
-                        int n;
-                        try { n = Integer.parseInt(count.getText().toString().trim()); }
-                        catch (NumberFormatException e) { n = 1; }
-                        if (n < 1) n = 1;
-                        String line = "SECTION " + index + " " + Fmt.ms(a[0]) + " "
-                                + (b[0] < 0 ? "END" : Fmt.ms(b[0]));
-                        line = line + (asMinutes.isChecked() ? (" FOR " + n + " MIN") : (" x" + n));
-                        cb.insert(line);
+                        long end = b[0];
+                        if (end >= 0 && end <= a[0]) end = a[0] + 15000;
+                        cb.picked(a[0], end);
                     }
                 }).create();
 
@@ -3523,9 +4599,7 @@ public final class AbDialog {
                     int dur = duration(mp, ready);
                     if (!bar.isPressed()) bar.setProgress(pos);
                     clock.setText(Fmt.ms(pos) + " / " + Fmt.ms(dur));
-                    if (loopAb[0] && b[0] > 0 && pos >= b[0]) {
-                        try { mp.seekTo((int) a[0]); } catch (IllegalStateException e) { /* ignore */ }
-                    }
+                    if (loopAb[0] && b[0] > 0 && pos >= b[0]) seekTo(mp, ready, a[0]);
                     boolean playing = false;
                     try { playing = mp.isPlaying(); } catch (IllegalStateException e) { /* ignore */ }
                     Ui.setIcon(play, playing ? Ico.PAUSE : Ico.PLAY, Ui.ONACC);
@@ -3536,9 +4610,7 @@ public final class AbDialog {
 
         bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             public void onProgressChanged(SeekBar s, int prog, boolean fromUser) {
-                if (fromUser && ready[0]) {
-                    try { mp.seekTo(prog); } catch (IllegalStateException e) { /* ignore */ }
-                }
+                if (fromUser) seekTo(mp, ready, prog);
             }
             public void onStartTrackingTouch(SeekBar s) { }
             public void onStopTrackingTouch(SeekBar s) { }
@@ -3562,17 +4634,18 @@ public final class AbDialog {
                     ready[0] = true;
                     bar.setMax(Math.max(1, m.getDuration()));
                     clock.setText("0:00 / " + Fmt.ms(m.getDuration()));
+                    seekTo(mp, ready, a[0]);
                 }
             });
             mp.setOnErrorListener(new MediaPlayer.OnErrorListener() {
                 public boolean onError(MediaPlayer m, int what, int extra) {
-                    toast(act, "Cannot play this file");
+                    Ui.toast(act, "Cannot play this file");
                     return true;
                 }
             });
             mp.prepareAsync();
         } catch (Exception e) {
-            toast(act, "Cannot open this file");
+            Ui.toast(act, "Cannot open this file");
         }
 
         dlg.show();
@@ -3583,7 +4656,7 @@ public final class AbDialog {
 
     private static View markRow(Activity act, TextView label, View.OnClickListener setNow, final Nudge n) {
         LinearLayout r = Ui.row(act);
-        Ui.margin(act, r, 0, 2, 0, 2);
+        Ui.margin(act, r, 0, 4, 0, 4);
         label.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
         r.addView(label);
         r.addView(nudge(act, "-1s", new View.OnClickListener() {
@@ -3615,6 +4688,11 @@ public final class AbDialog {
         catch (IllegalStateException e) { /* ignore */ }
     }
 
+    private static void seekTo(MediaPlayer mp, boolean[] ready, long ms) {
+        if (!ready[0]) return;
+        try { mp.seekTo((int) Math.max(0, ms)); } catch (IllegalStateException e) { /* ignore */ }
+    }
+
     private static int position(MediaPlayer mp, boolean[] ready) {
         if (!ready[0]) return 0;
         try { return Math.max(0, mp.getCurrentPosition()); } catch (IllegalStateException e) { return 0; }
@@ -3623,10 +4701,6 @@ public final class AbDialog {
     private static int duration(MediaPlayer mp, boolean[] ready) {
         if (!ready[0]) return 0;
         try { return Math.max(0, mp.getDuration()); } catch (IllegalStateException e) { return 0; }
-    }
-
-    private static void toast(Activity act, String s) {
-        Toast.makeText(act, s, Toast.LENGTH_SHORT).show();
     }
 }
 '@
@@ -3645,9 +4719,9 @@ Say "`n[2/3] building"
 $ErrorActionPreference = 'Continue'
 Push-Location $OutDir
 try {
-    Remove-Item -LiteralPath '.\unaligned.apk', '.\classes.dex', '.\compiled_res.zip', ".\$ApkName", ".\$ApkName.idsig" `
-                -Force -ErrorAction SilentlyContinue
-    Get-ChildItem -Path ".\$PKG_PATH" -Filter *.class -ErrorAction SilentlyContinue | Remove-Item -Force
+    Remove-Item -LiteralPath '.\unaligned.apk', '.\classes.dex', '.\compiled_res.zip', '.\classes.jar', `
+                ".\$ApkName", ".\$ApkName.idsig" -Force -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '.\classes'
 
     # 1. resources -> flat archive
     aapt2 compile --dir res -o compiled_res.zip
@@ -3664,20 +4738,25 @@ try {
     Get-ChildItem -Path ".\$PKG_PATH" -Filter *.java |
         ForEach-Object { '"' + $_.FullName.Replace([char]92, [char]47) + '"' } |
         Out-File -LiteralPath 'javac.args' -Encoding ASCII
-    cmd /c "javac -nowarn -Xlint:-options -source 8 -target 8 -bootclasspath ""$AndroidJar"" -encoding US-ASCII @javac.args > javac.log 2>&1"
+    New-Item -ItemType Directory -Force -Path '.\classes' | Out-Null
+    cmd /c "javac -nowarn -Xlint:-options -source 8 -target 8 -bootclasspath ""$AndroidJar"" -encoding US-ASCII -d classes @javac.args > javac.log 2>&1"
     if ($LASTEXITCODE -ne 0) { Get-Content -LiteralPath 'javac.log' | Write-Host }
     Assert-Exit 'javac'
 
-    # 4. class -> dex
-    $classes = Get-ChildItem -Path ".\$PKG_PATH" -Filter *.class | ForEach-Object { $_.FullName }
-    d8.bat --lib $AndroidJar --min-api 26 --output . @classes
+    # 4. bundle the classes so d8 gets one short argument
+    #    (inner classes alone would blow past the Windows command line limit)
+    jar.exe cf classes.jar -C classes .
+    Assert-Exit 'jar (collect classes)'
+
+    # 5. class -> dex
+    d8.bat --lib $AndroidJar --min-api 26 --output . classes.jar
     Assert-Exit 'd8'
 
-    # 5. add the dex to the apk
+    # 6. add the dex to the apk
     jar.exe uf unaligned.apk classes.dex
     Assert-Exit 'jar (add classes.dex)'
 
-    # 6. align, then sign (signing preserves the alignment)
+    # 7. align, then sign (signing preserves the alignment)
     zipalign.exe -f 4 unaligned.apk $ApkName
     Assert-Exit 'zipalign'
 
