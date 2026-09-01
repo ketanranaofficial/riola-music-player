@@ -4311,6 +4311,7 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
         undoAt = -1;
         if (back == null || prog == null) {
             refresh();          // at least clear the strip rather than sit there dead
+            Ui.toast(this, "Too late to undo");
             return;
         }
         prog.steps.add(Math.max(0, Math.min(at, prog.steps.size())), back);
@@ -4323,7 +4324,7 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
         undoStep = prog.steps.remove(index);
         undoAt = index;
         ui.removeCallbacks(clearUndo);
-        ui.postDelayed(clearUndo, 8000);
+        ui.postDelayed(clearUndo, 15000);
         save();
         refresh();
     }
