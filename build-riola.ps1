@@ -3600,6 +3600,8 @@ public class MainActivity extends Activity implements PlayerBar.Host {
     private final List<View> liveRows = new ArrayList<View>();
     private boolean wasRunning;
     private String liveProgramId = "";
+    /** Survives the recreate() that a theme change triggers. */
+    private static boolean reopenSettings;
 
     @Override
     protected void onCreate(Bundle saved) {
@@ -3612,6 +3614,10 @@ public class MainActivity extends Activity implements PlayerBar.Host {
         Bell.warm();
         setContentView(build());
         Ui.applyWindow(this);
+        if (reopenSettings) {
+            reopenSettings = false;
+            settings();
+        }
     }
 
     @Override
@@ -3986,12 +3992,21 @@ public class MainActivity extends Activity implements PlayerBar.Host {
     }
 
     private void settings() {
+        final android.app.AlertDialog[] holder = new android.app.AlertDialog[1];
+
         LinearLayout box = Ui.col(this);
         int p = Ui.dp(this, 18);
         box.setPadding(p, Ui.dp(this, 6), p, 0);
 
         box.addView(Ui.switchRow(this, "Dark theme", null, prefs.dark(), new Ui.OnToggle() {
-            public void set(boolean v) { prefs.dark(v); recreate(); }
+            public void set(boolean v) {
+                prefs.dark(v);
+                // the dialog belongs to this activity, so it has to go before the
+                // activity does - otherwise it lingers in the old colours
+                if (holder[0] != null) holder[0].dismiss();
+                reopenSettings = true;
+                recreate();
+            }
         }));
         box.addView(Ui.switchRow(this, "Keep the screen on", "while the app is open",
                 prefs.keepScreenOn(), new Ui.OnToggle() {
@@ -4042,6 +4057,8 @@ public class MainActivity extends Activity implements PlayerBar.Host {
             public void onClick(View v) {
                 prefs.resetAll();
                 Ui.toast(MainActivity.this, "Settings reset");
+                if (holder[0] != null) holder[0].dismiss();
+                reopenSettings = true;
                 recreate();
             }
         }));
@@ -4051,7 +4068,9 @@ public class MainActivity extends Activity implements PlayerBar.Host {
 
         ScrollView sv = new ScrollView(this);
         sv.addView(box, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
-        Ui.dialog(this).setTitle("Settings").setView(sv).setPositiveButton("Done", null).show();
+        holder[0] = Ui.dialog(this).setTitle("Settings").setView(sv)
+                .setPositiveButton("Done", null).create();
+        holder[0].show();
     }
 }
 '@
