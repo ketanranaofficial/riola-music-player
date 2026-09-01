@@ -17,3 +17,8 @@ Thumbs.db
 *.jks
 *.keystore
 key.properties
+
+# Local, machine-specific notes and assistant memory - never published
+.claude/
+.riola-local/
+NOTES.local.md
