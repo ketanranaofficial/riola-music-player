@@ -893,72 +893,6 @@ public final class Store {
         sp(c).edit().putString("programs", arr.toString()).apply();
     }
 
-    // ---- backup ----------------------------------------------------------
-    /** The whole library and every program, as readable json. */
-    public static String backup(Context c) {
-        try {
-            JSONObject o = new JSONObject();
-            o.put("riola", 1);
-            o.put("saved", System.currentTimeMillis());
-            JSONArray lib = new JSONArray();
-            for (Track t : LIB) {
-                JSONObject j = new JSONObject();
-                j.put("u", t.uri);
-                j.put("t", t.title);
-                j.put("d", t.durMs);
-                lib.put(j);
-            }
-            o.put("lib", lib);
-            JSONArray progs = new JSONArray();
-            for (Program p : PROGRAMS) progs.put(p.toJson());
-            o.put("programs", progs);
-            return o.toString(2);
-        } catch (Exception e) {
-            return "";
-        }
-    }
-
-    /**
-     * Adds everything in a backup alongside what is already here; nothing is
-     * overwritten. Returns {programs added, tracks added}.
-     */
-    public static int[] restore(Context c, String json) {
-        int progs = 0, tracks = 0;
-        try {
-            JSONObject o = new JSONObject(json);
-            JSONArray lib = o.optJSONArray("lib");
-            if (lib != null) {
-                for (int i = 0; i < lib.length(); i++) {
-                    JSONObject j = lib.optJSONObject(i);
-                    if (j == null) continue;
-                    String uri = j.optString("u", "");
-                    if (uri.length() == 0 || byUri(uri) != null) continue;
-                    LIB.add(new Track(uri, j.optString("t", "track"), j.optLong("d", 0)));
-                    tracks++;
-                }
-            }
-            JSONArray arr = o.optJSONArray("programs");
-            if (arr != null) {
-                for (int i = 0; i < arr.length(); i++) {
-                    JSONObject j = arr.optJSONObject(i);
-                    if (j == null) continue;
-                    Program p = Program.fromJson(j);
-                    if (program(p.id) != null) {          // same program restored twice
-                        p.id = Program.blank(p.name).id;
-                        p.name = p.name + " (restored)";
-                    }
-                    PROGRAMS.add(p);
-                    progs++;
-                }
-            }
-        } catch (Exception e) {
-            return new int[]{ -1, -1 };
-        }
-        saveLib(c);
-        savePrograms(c);
-        return new int[]{ progs, tracks };
-    }
-
     /** A ready made program so a new user can hear something immediately. */
     public static Program sample() {
         Program p = Program.blank("My first program");
@@ -1845,18 +1779,18 @@ import android.os.Looper;
  */
 public class Bell {
 
-    public static final int LOW = 0, WARM = 1, BRIGHT = 2;
+    public static final int LOW = 0, WARM = 1, BRIGHT = 2, DESK = 3;
 
     private static final int RATE = 22050;
-    private static final float[] F0    = { 174.6f, 261.6f, 392.0f };   // F3, C4, G4
-    private static final long[]  LEN   = { 6000, 5000, 4000 };
-    private static final String[] NAMES = { "low", "warm", "bright" };
+    private static final float[] F0    = { 174.6f, 261.6f, 392.0f, 1046.5f };  // F3, C4, G4, C6
+    private static final long[]  LEN   = { 6000, 5000, 4000, 1500 };
+    private static final String[] NAMES = { "low", "warm", "bright", "desk" };
 
-    private static final short[][] CACHE = new short[3][];
+    private static final short[][] CACHE = new short[4][];
 
     private AudioTrack track;
 
-    public static int clamp(int tone) { return tone < 0 ? 0 : (tone > 2 ? 2 : tone); }
+    public static int clamp(int tone) { return tone < 0 ? 0 : (tone > 3 ? 3 : tone); }
     public static long lengthMs(int tone) { return LEN[clamp(tone)]; }
     public static String toneName(int tone) { return NAMES[clamp(tone)]; }
 
@@ -1878,23 +1812,44 @@ public class Bell {
         float f0 = F0[tone];
 
         // partial: ratio to the fundamental, starting level, seconds to decay
-        float[] ratio = { 0.5f,  1.0f,  2.0f,  2.97f, 4.06f, 5.43f };
-        float[] amp   = { 0.32f, 1.00f, 0.40f, 0.18f, 0.09f, 0.05f };
-        float[] decay = { 6.5f,  4.5f,  2.4f,  1.3f,  0.8f,  0.45f };
+        float[] ratio, amp, decay;
+        float attack, tail, scale, shimmer;
+        if (tone == DESK) {
+            // a little metal dome struck once: high, inharmonic, and gone in
+            // about a second. Short decays are what make it read as a "ting"
+            // rather than a chime.
+            ratio = new float[]{ 1.00f, 2.71f, 5.18f, 8.16f, 9.42f };
+            amp   = new float[]{ 1.00f, 0.55f, 0.30f, 0.15f, 0.07f };
+            decay = new float[]{ 0.95f, 0.58f, 0.34f, 0.20f, 0.12f };
+            attack = 0.002f;
+            tail = 0.12f;
+            scale = 9000f;
+            shimmer = 0f;
+        } else {
+            ratio = new float[]{ 0.5f,  1.0f,  2.0f,  2.97f, 4.06f, 5.43f };
+            amp   = new float[]{ 0.32f, 1.00f, 0.40f, 0.18f, 0.09f, 0.05f };
+            decay = new float[]{ 6.5f,  4.5f,  2.4f,  1.3f,  0.8f,  0.45f };
+            attack = 0.008f;
+            tail = 0.35f;
+            scale = 11000f;
+            shimmer = 0.22f;
+        }
 
         double w = 2.0 * Math.PI / RATE;
-        float attack = 0.008f;   // seconds
-        float tail = 0.35f;      // fade the very end so the buffer cannot click
-        float scale = 11000f;
 
         for (int i = 0; i < n; i++) {
             float t = i / (float) RATE;
             float s = 0f;
             for (int k = 0; k < ratio.length; k++) {
+                // a partial above the nyquist limit does not disappear, it folds
+                // back down as an out of tune whine - so it never gets written
+                if (f0 * ratio[k] > RATE * 0.45f) continue;
                 s += amp[k] * (float) Math.exp(-t / decay[k]) * (float) Math.sin(w * f0 * ratio[k] * i);
             }
             // a second prime a hair sharp gives the tone a slow, warm shimmer
-            s += 0.22f * (float) Math.exp(-t / 4.0f) * (float) Math.sin(w * f0 * 1.003f * i);
+            if (shimmer > 0f) {
+                s += shimmer * (float) Math.exp(-t / 4.0f) * (float) Math.sin(w * f0 * 1.003f * i);
+            }
 
             if (t < attack) s *= 0.5f - 0.5f * (float) Math.cos(Math.PI * t / attack);
             float left = (n - i) / (float) RATE;
@@ -3631,6 +3586,259 @@ public final class Pickers {
 '@
 
 # ---------------------------------------------------------------------------
+# Java: exporting and importing programs
+# ---------------------------------------------------------------------------
+Write-Src "$PKG_PATH\Backup.java" @'
+package com.riola.player;
+
+import android.app.Activity;
+import android.content.Intent;
+import android.net.Uri;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Writing programs out to a file and reading them back.
+ *
+ * Import is deliberately suspicious of what it is handed: the file came from a
+ * picker and could be anything at all.
+ */
+public final class Backup {
+
+    private static final int MAX_BYTES = 4 * 1024 * 1024;
+
+    /** What the next create-document result should write. */
+    private static String pending = "";
+
+    private Backup() { }
+
+    // ---- export ----------------------------------------------------------
+    public static void exportAll(Activity a, int req) {
+        if (Store.PROGRAMS.isEmpty()) {
+            Ui.toast(a, "There are no programs to export");
+            return;
+        }
+        pending = json(new ArrayList<Program>(Store.PROGRAMS), true);
+        ask(a, req, "riola-programs.json");
+    }
+
+    public static void exportOne(Activity a, Program p, int req) {
+        if (p == null) return;
+        List<Program> one = new ArrayList<Program>();
+        one.add(p);
+        pending = json(one, false);
+        ask(a, req, "riola-" + safe(p.name) + ".json");
+    }
+
+    private static void ask(Activity a, int req, String name) {
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("application/json")
+                .putExtra(Intent.EXTRA_TITLE, name);
+        try { a.startActivityForResult(i, req); }
+        catch (Exception e) { Ui.toast(a, "No file picker on this device"); }
+    }
+
+    public static void pickToImport(Activity a, int req) {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("*/*");
+        try { a.startActivityForResult(i, req); }
+        catch (Exception e) { Ui.toast(a, "No file picker on this device"); }
+    }
+
+    /** Writes whatever the last export call prepared. */
+    public static void write(Activity a, Uri uri) {
+        String body = pending;
+        pending = "";
+        if (uri == null || body.length() == 0) {
+            Ui.toast(a, "Nothing to write");
+            return;
+        }
+        OutputStream out = null;
+        try {
+            out = a.getContentResolver().openOutputStream(uri);
+            if (out == null) { Ui.toast(a, "Could not write that file"); return; }
+            out.write(body.getBytes("UTF-8"));
+            out.flush();
+            Ui.toast(a, "Exported");
+        } catch (Exception e) {
+            Ui.toast(a, "Could not write that file");
+        } finally {
+            if (out != null) try { out.close(); } catch (Exception e) { /* ignore */ }
+        }
+    }
+
+    private static String json(List<Program> progs, boolean everyTrack) {
+        try {
+            JSONObject o = new JSONObject();
+            o.put("riola", 1);
+            o.put("saved", System.currentTimeMillis());
+
+            JSONArray parr = new JSONArray();
+            for (int i = 0; i < progs.size(); i++) parr.put(progs.get(i).toJson());
+            o.put("programs", parr);
+
+            // carry the track names and lengths so an import still reads
+            // sensibly even where the files themselves cannot be opened
+            JSONArray lib = new JSONArray();
+            for (Track t : Store.LIB) {
+                if (!everyTrack && !usedBy(progs, t.uri)) continue;
+                JSONObject j = new JSONObject();
+                j.put("u", t.uri);
+                j.put("t", t.title);
+                j.put("d", t.durMs);
+                lib.put(j);
+            }
+            o.put("lib", lib);
+            return o.toString(2);
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private static boolean usedBy(List<Program> progs, String uri) {
+        for (int i = 0; i < progs.size(); i++) {
+            List<Step> steps = progs.get(i).steps;
+            for (int k = 0; k < steps.size(); k++) {
+                if (uri.equals(steps.get(k).trackUri)) return true;
+            }
+        }
+        return false;
+    }
+
+    private static String safe(String name) {
+        StringBuilder sb = new StringBuilder();
+        String s = name == null ? "" : name.trim();
+        for (int i = 0; i < s.length() && sb.length() < 40; i++) {
+            char c = s.charAt(i);
+            if (Character.isLetterOrDigit(c)) sb.append(c);
+            else if (c == ' ' || c == '-' || c == '_') sb.append('-');
+        }
+        return sb.length() == 0 ? "program" : sb.toString();
+    }
+
+    // ---- import ----------------------------------------------------------
+    public static void read(final Activity a, Uri uri) {
+        if (uri == null) return;
+
+        String text = null;
+        InputStream in = null;
+        try {
+            in = a.getContentResolver().openInputStream(uri);
+            if (in == null) { fail(a, "Riola could not open that file."); return; }
+            ByteArrayOutputStream buf = new ByteArrayOutputStream();
+            byte[] chunk = new byte[8192];
+            int n, total = 0;
+            while ((n = in.read(chunk)) > 0) {
+                total += n;
+                if (total > MAX_BYTES) {
+                    fail(a, "That file is far too large to be a Riola export.");
+                    return;
+                }
+                buf.write(chunk, 0, n);
+            }
+            text = new String(buf.toByteArray(), "UTF-8");
+        } catch (Exception e) {
+            fail(a, "Riola could not read that file.");
+            return;
+        } finally {
+            if (in != null) try { in.close(); } catch (Exception e) { /* ignore */ }
+        }
+
+        if (text.trim().length() == 0) {
+            fail(a, "That file is empty.");
+            return;
+        }
+
+        JSONObject root;
+        try {
+            root = new JSONObject(text);
+        } catch (Exception e) {
+            fail(a, "That is not a Riola export. Pick the .json file that Riola wrote.");
+            return;
+        }
+
+        JSONArray arr = root.optJSONArray("programs");
+        if (arr == null || arr.length() == 0) {
+            fail(a, "That file is readable, but there are no Riola programs inside it.");
+            return;
+        }
+
+        int tracks = 0;
+        JSONArray lib = root.optJSONArray("lib");
+        if (lib != null) {
+            for (int i = 0; i < lib.length(); i++) {
+                JSONObject j = lib.optJSONObject(i);
+                if (j == null) continue;
+                String u = j.optString("u", "");
+                if (u.length() == 0 || Store.byUri(u) != null) continue;
+                Store.LIB.add(new Track(u, j.optString("t", "track"), j.optLong("d", 0)));
+                tracks++;
+            }
+        }
+
+        int added = 0, skipped = 0;
+        boolean anyMissing = false;
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject j = arr.optJSONObject(i);
+            if (j == null) { skipped++; continue; }
+            try {
+                Program p = Program.fromJson(j);
+                if (p.name == null || p.name.trim().length() == 0) p.name = "Imported program";
+                if (p.steps.isEmpty() && j.optJSONArray("st") == null) { skipped++; continue; }
+                if (Store.program(p.id) != null) {          // already here, keep both
+                    p.id = Program.blank(p.name).id;
+                    p.name = p.name + " (imported)";
+                }
+                p.updated = System.currentTimeMillis();
+                Store.PROGRAMS.add(p);
+                if (p.hasMissing()) anyMissing = true;
+                added++;
+            } catch (Exception e) {
+                skipped++;
+            }
+        }
+
+        Store.saveLib(a);
+        Store.savePrograms(a);
+
+        if (added == 0) {
+            fail(a, "Nothing in that file could be read as a program.");
+            return;
+        }
+
+        StringBuilder msg = new StringBuilder();
+        msg.append("Added ").append(added).append(added == 1 ? " program" : " programs");
+        if (tracks > 0) msg.append(" and ").append(tracks).append(tracks == 1 ? " track" : " tracks");
+        msg.append(".");
+        if (skipped > 0) {
+            msg.append("\n\n").append(skipped).append(skipped == 1 ? " entry was" : " entries were")
+               .append(" skipped because they could not be read.");
+        }
+        if (anyMissing) {
+            msg.append("\n\nSome steps point at files this phone cannot open, so they are marked "
+                     + "missing. Add those tracks again and the steps will reconnect on their own.");
+        }
+        Ui.dialog(a).setTitle("Imported").setMessage(msg.toString())
+                .setPositiveButton("Done", null).show();
+    }
+
+    private static void fail(Activity a, String why) {
+        Ui.dialog(a).setTitle("Could not import").setMessage(why)
+                .setPositiveButton("OK", null).show();
+    }
+}
+'@
+
+# ---------------------------------------------------------------------------
 # Java: home screen (saved programs)
 # ---------------------------------------------------------------------------
 Write-Src "$PKG_PATH\MainActivity.java" @'
@@ -3776,6 +3984,21 @@ public class MainActivity extends Activity implements PlayerBar.Host {
         add.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
         Ui.margin(this, add, 0, 10, 0, 0);
         progs.addView(add);
+
+        LinearLayout io = Ui.row(this);
+        Ui.margin(this, io, 0, 4, 0, 0);
+        LinearLayout exportAll = Ui.btn(this, "Export all", Ico.SAVE, Ui.GHOST, new View.OnClickListener() {
+            public void onClick(View v) { Backup.exportAll(MainActivity.this, REQ_EXPORT); }
+        });
+        exportAll.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        io.addView(exportAll);
+        LinearLayout importOne = Ui.btn(this, "Import", Ico.OPEN, Ui.GHOST, new View.OnClickListener() {
+            public void onClick(View v) { Backup.pickToImport(MainActivity.this, REQ_IMPORT); }
+        });
+        importOne.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        io.addView(importOne);
+        progs.addView(io);
+
         body.addView(progs);
 
         body.addView(Ui.gap(this, 6));
@@ -3880,7 +4103,7 @@ public class MainActivity extends Activity implements PlayerBar.Host {
     }
 
     private void menu(final Program p) {
-        final String[] items = { "Play", "Edit", "Rename", "Duplicate", "Delete" };
+        final String[] items = { "Play", "Edit", "Rename", "Duplicate", "Export to a file", "Delete" };
         Ui.dialog(this).setTitle(p.name).setItems(items, new DialogInterface.OnClickListener() {
             public void onClick(DialogInterface d, int which) {
                 switch (which) {
@@ -3902,6 +4125,9 @@ public class MainActivity extends Activity implements PlayerBar.Host {
                         Ui.toast(MainActivity.this, "Duplicated");
                         break;
                     }
+                    case 4:
+                        Backup.exportOne(MainActivity.this, p, REQ_EXPORT);
+                        break;
                     default:
                         Ui.dialog(MainActivity.this).setTitle("Delete " + p.name + "?")
                                 .setMessage("The program is removed. Your audio files are untouched.")
@@ -4038,62 +4264,15 @@ public class MainActivity extends Activity implements PlayerBar.Host {
     // ======================================================================
     // backup
     // ======================================================================
-    private void exportPrograms() {
-        if (Store.PROGRAMS.isEmpty()) { Ui.toast(this, "Nothing to back up yet"); return; }
-        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT)
-                .addCategory(Intent.CATEGORY_OPENABLE)
-                .setType("application/json")
-                .putExtra(Intent.EXTRA_TITLE, "riola-backup.json");
-        try { startActivityForResult(i, REQ_EXPORT); }
-        catch (Exception e) { Ui.toast(this, "No file picker on this device"); }
-    }
-
-    private void importPrograms() {
-        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT)
-                .addCategory(Intent.CATEGORY_OPENABLE)
-                .setType("*/*");
-        try { startActivityForResult(i, REQ_IMPORT); }
-        catch (Exception e) { Ui.toast(this, "No file picker on this device"); }
-    }
-
     @Override
     protected void onActivityResult(int req, int result, Intent data) {
         super.onActivityResult(req, result, data);
         if (result != RESULT_OK || data == null || data.getData() == null) return;
-        android.net.Uri uri = data.getData();
-
         if (req == REQ_EXPORT) {
-            java.io.OutputStream out = null;
-            try {
-                out = getContentResolver().openOutputStream(uri);
-                out.write(Store.backup(this).getBytes("UTF-8"));
-                Ui.toast(this, "Backed up " + Store.PROGRAMS.size() + " program(s)");
-            } catch (Exception e) {
-                Ui.toast(this, "Could not write that file");
-            } finally {
-                if (out != null) try { out.close(); } catch (Exception e) { /* ignore */ }
-            }
-
+            Backup.write(this, data.getData());
         } else if (req == REQ_IMPORT) {
-            java.io.InputStream in = null;
-            try {
-                in = getContentResolver().openInputStream(uri);
-                java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
-                byte[] chunk = new byte[8192];
-                int n;
-                while ((n = in.read(chunk)) > 0) buf.write(chunk, 0, n);
-                int[] added = Store.restore(this, new String(buf.toByteArray(), "UTF-8"));
-                if (added[0] < 0) {
-                    Ui.toast(this, "That does not look like a Riola backup");
-                } else {
-                    Ui.toast(this, "Restored " + added[0] + " program(s) and " + added[1] + " track(s)");
-                    refresh();
-                }
-            } catch (Exception e) {
-                Ui.toast(this, "Could not read that file");
-            } finally {
-                if (in != null) try { in.close(); } catch (Exception e) { /* ignore */ }
-            }
+            Backup.read(this, data.getData());
+            refresh();
         }
     }
 
@@ -4182,31 +4361,6 @@ public class MainActivity extends Activity implements PlayerBar.Host {
         box.addView(note);
 
         box.addView(Ui.divider(this));
-        box.addView(Ui.tv(this, "BACKUP", 11, Ui.DIM, true));
-        LinearLayout backup = Ui.row(this);
-        Ui.margin(this, backup, 0, 8, 0, 0);
-        LinearLayout save = Ui.btn(this, "Back up", Ico.SAVE, Ui.SECONDARY, new View.OnClickListener() {
-            public void onClick(View v) {
-                if (holder[0] != null) holder[0].dismiss();
-                exportPrograms();
-            }
-        });
-        save.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
-        Ui.margin(this, save, 0, 0, 8, 0);
-        backup.addView(save);
-        LinearLayout load = Ui.btn(this, "Restore", Ico.OPEN, Ui.SECONDARY, new View.OnClickListener() {
-            public void onClick(View v) {
-                if (holder[0] != null) holder[0].dismiss();
-                importPrograms();
-            }
-        });
-        load.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
-        backup.addView(load);
-        box.addView(backup);
-        box.addView(Ui.tv(this, "Writes every program and the track list to a file you choose. "
-                + "Restoring adds them back alongside whatever is already here.", 11, Ui.DIM, false));
-
-        box.addView(Ui.divider(this));
         box.addView(Ui.btn(this, "Reset settings to defaults", 0, Ui.DANGER, new View.OnClickListener() {
             public void onClick(View v) {
                 prefs.resetAll();
@@ -4255,6 +4409,8 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
     private Engine eng;
     private PlayerBar bar;
     private Program prog;
+
+    private static final int REQ_EXPORT = 301;
 
     private LinearLayout stepsBox, loopBox;
     private android.widget.ScrollView scroller;
@@ -4647,7 +4803,7 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
     }
 
     private void menu() {
-        final String[] items = { "Rename", "Duplicate", "Delete program" };
+        final String[] items = { "Rename", "Duplicate", "Export to a file", "Delete program" };
         Ui.dialog(this).setTitle(prog.name).setItems(items, new DialogInterface.OnClickListener() {
             public void onClick(DialogInterface d, int which) {
                 if (which == 0) {
@@ -4655,6 +4811,8 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
                 } else if (which == 1) {
                     Store.put(EditorActivity.this, prog.copyAs(prog.name + " copy"));
                     Ui.toast(EditorActivity.this, "Duplicated");
+                } else if (which == 2) {
+                    Backup.exportOne(EditorActivity.this, prog, REQ_EXPORT);
                 } else {
                     Ui.dialog(EditorActivity.this).setTitle("Delete " + prog.name + "?")
                             .setNegativeButton("Cancel", null)
@@ -4684,6 +4842,14 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
         dirty = true;
         Store.put(this, prog);
         dirty = false;
+    }
+
+    @Override
+    protected void onActivityResult(int req, int result, android.content.Intent data) {
+        super.onActivityResult(req, result, data);
+        if (req == REQ_EXPORT && result == RESULT_OK && data != null) {
+            Backup.write(this, data.getData());
+        }
     }
 
     // ======================================================================
@@ -4867,7 +5033,7 @@ public final class StepSheet {
                 }
             }));
             if (step.endBell) {
-                box.addView(Ui.seg(a, new String[]{ "Low", "Warm", "Bright" }, Bell.clamp(step.tone),
+                box.addView(Ui.seg(a, new String[]{ "Low", "Warm", "Bright", "Desk" }, Bell.clamp(step.tone),
                         new Ui.OnPick() {
                     public void set(int i) {
                         step.tone = i;
@@ -4880,7 +5046,7 @@ public final class StepSheet {
         } else if (step.type == Step.BELL) {
             box.addView(Ui.tv(a, "TONE", 11, Ui.DIM, true));
             box.addView(Ui.gap(a, 6));
-            box.addView(Ui.seg(a, new String[]{ "Low", "Warm", "Bright" }, Bell.clamp(step.tone),
+            box.addView(Ui.seg(a, new String[]{ "Low", "Warm", "Bright", "Desk" }, Bell.clamp(step.tone),
                     new Ui.OnPick() {
                 public void set(int i) {
                     step.tone = i;
