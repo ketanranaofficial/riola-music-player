@@ -1002,6 +1002,45 @@ public final class Store {
         sp(c).edit().putString("programs", arr.toString()).apply();
     }
 
+    // ---- ordering --------------------------------------------------------
+    /** Manual keeps whatever order the tracks were arranged into. */
+    public static final String[] SORTS = {
+        "Manual order", "Name A to Z", "Name Z to A",
+        "Recently added", "Oldest added", "Newest file", "Oldest file",
+        "Longest first", "Shortest first"
+    };
+
+    /**
+     * The library filtered and sorted for display. The stored order is never
+     * touched, so manual order survives being sorted and coming back.
+     */
+    public static List<Track> view(int mode, String filter) {
+        String f = filter == null ? "" : filter.trim().toLowerCase();
+        List<Track> out = new java.util.ArrayList<Track>();
+        for (Track t : LIB) {
+            if (f.length() == 0 || t.shortTitle().toLowerCase().contains(f)) out.add(t);
+        }
+        if (mode <= 0) return out;
+        final int m = mode;
+        Collections.sort(out, new Comparator<Track>() {
+            public int compare(Track a, Track b) {
+                switch (m) {
+                    case 1: return a.shortTitle().compareToIgnoreCase(b.shortTitle());
+                    case 2: return b.shortTitle().compareToIgnoreCase(a.shortTitle());
+                    case 3: return cmp(b.addedAt, a.addedAt);
+                    case 4: return cmp(a.addedAt, b.addedAt);
+                    case 5: return cmp(b.modifiedAt, a.modifiedAt);
+                    case 6: return cmp(a.modifiedAt, b.modifiedAt);
+                    case 7: return cmp(b.durMs, a.durMs);
+                    default: return cmp(a.durMs, b.durMs);
+                }
+            }
+        });
+        return out;
+    }
+
+    private static int cmp(long a, long b) { return a == b ? 0 : (a < b ? -1 : 1); }
+
     /** A ready made program so a new user can hear something immediately. */
     public static Program sample() {
         Program p = Program.blank("My first program");
@@ -3955,11 +3994,7 @@ Write-Src "$PKG_PATH\Pickers.java" @'
 package com.riola.player;
 
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.content.DialogInterface;
-import android.text.Editable;
-import android.text.InputType;
-import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.EditText;
@@ -3979,87 +4014,11 @@ public final class Pickers {
 
     // ---- track -----------------------------------------------------------
     public static void track(final Activity a, String title, final OnTrack cb) {
-        if (Store.LIB.isEmpty()) {
-            Ui.dialog(a).setTitle("No tracks yet")
-                    .setMessage("Add some audio files first and they will show up here.")
-                    .setNegativeButton("Not now", null)
-                    .setPositiveButton("Add tracks", new DialogInterface.OnClickListener() {
-                        public void onClick(DialogInterface d, int w) {
-                            a.startActivity(new android.content.Intent(a, LibraryActivity.class));
-                        }
-                    }).show();
-            return;
-        }
-
-        LinearLayout box = Ui.col(a);
-        int p = Ui.dp(a, 12);
-        box.setPadding(p, p, p, p);
-
-        final LinearLayout list = Ui.col(a);
-        final AlertDialog[] holder = new AlertDialog[1];
-
-        if (Store.LIB.size() > 7) {
-            final EditText search = new EditText(a);
-            search.setHint("Search tracks");
-            search.setSingleLine(true);
-            search.setTextColor(Ui.TXT);
-            search.setHintTextColor(Ui.DIM);
-            search.setInputType(InputType.TYPE_CLASS_TEXT);
-            search.addTextChangedListener(new TextWatcher() {
-                public void beforeTextChanged(CharSequence s, int x, int y, int z) { }
-                public void onTextChanged(CharSequence s, int x, int y, int z) { }
-                public void afterTextChanged(Editable e) {
-                    fill(a, list, e.toString(), holder, cb);
-                }
-            });
-            box.addView(search);
-        }
-        box.addView(list);
-        fill(a, list, "", holder, cb);
-
-        ScrollView sv = new ScrollView(a);
-        sv.addView(box, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
-        holder[0] = Ui.dialog(a).setTitle(title).setView(sv)
-                .setNegativeButton("Cancel", null)
-                .setNeutralButton("Manage tracks", new DialogInterface.OnClickListener() {
-                    public void onClick(DialogInterface d, int w) {
-                        a.startActivity(new android.content.Intent(a, LibraryActivity.class));
-                    }
-                }).create();
-        holder[0].show();
-    }
-
-    private static void fill(final Activity a, LinearLayout list, String query,
-                             final AlertDialog[] holder, final OnTrack cb) {
-        list.removeAllViews();
-        String q = query.toLowerCase().trim();
-        int shown = 0;
-        for (int i = 0; i < Store.LIB.size(); i++) {
-            final Track t = Store.LIB.get(i);
-            if (q.length() > 0 && !t.shortTitle().toLowerCase().contains(q)) continue;
-            shown++;
-            LinearLayout r = Ui.row(a);
-            r.setBackground(Ui.ripple(Ui.rr(a, Ui.SURF2, 10)));
-            r.setPadding(Ui.dp(a, 12), Ui.dp(a, 10), Ui.dp(a, 12), Ui.dp(a, 10));
-            Ui.margin(a, r, 0, 0, 0, 6);
-            r.addView(Ui.icon(a, Ico.NOTE, Ui.ACC_TXT, 16));
-            r.addView(Ui.hgap(a, 10));
-            LinearLayout col = Ui.col(a);
-            col.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
-            TextView name = Ui.tv(a, t.shortTitle(), 14, Ui.TXT, false);
-            Ui.ellipsize(name);
-            col.addView(name);
-            col.addView(Ui.tv(a, t.durMs > 0 ? Fmt.ms(t.durMs) : "length unknown", 11, Ui.DIM, false));
-            r.addView(col);
-            r.setOnClickListener(new View.OnClickListener() {
-                public void onClick(View v) {
-                    if (holder[0] != null) holder[0].dismiss();
-                    cb.picked(t);
-                }
-            });
-            list.addView(r);
-        }
-        if (shown == 0) list.addView(Ui.tv(a, "Nothing matches that.", 13, Ui.DIM, false));
+        TrackPicker.show(a, title, false, new TrackPicker.OnPicked() {
+            public void picked(java.util.List<Track> picked) {
+                if (!picked.isEmpty()) cb.picked(picked.get(0));
+            }
+        });
     }
 
     // ---- length ----------------------------------------------------------
@@ -4476,6 +4435,233 @@ public final class Backup {
 '@
 
 # ---------------------------------------------------------------------------
+# Java: picking tracks, with the library's own tools
+# ---------------------------------------------------------------------------
+Write-Src "$PKG_PATH\TrackPicker.java" @'
+package com.riola.player;
+
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.DialogInterface;
+import android.content.Intent;
+import android.text.Editable;
+import android.text.TextWatcher;
+import android.view.View;
+import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
+
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * Choosing tracks with the same handles the library screen has - search and
+ * sort - because a list that is fine at five tracks is useless at three
+ * hundred.
+ *
+ * Tap the icon at the left of a row, or hold a row, to start picking several
+ * at once.
+ */
+public final class TrackPicker {
+
+    public interface OnPicked { void picked(List<Track> tracks); }
+
+    private TrackPicker() { }
+
+    public static void show(final Activity a, String title, final boolean allowMultiple,
+                            final OnPicked cb) {
+        if (Store.LIB.isEmpty()) {
+            Ui.dialog(a).setTitle("No tracks yet")
+                    .setMessage("Add some audio first and it will show up here.")
+                    .setNegativeButton("Not now", null)
+                    .setPositiveButton("Add tracks", new DialogInterface.OnClickListener() {
+                        public void onClick(DialogInterface d, int w) {
+                            a.startActivity(new Intent(a, LibraryActivity.class));
+                        }
+                    }).show();
+            return;
+        }
+
+        final Prefs prefs = new Prefs(a);
+        final String[] filter = { "" };
+        final boolean[] choosing = { false };
+        final Set<String> chosen = new LinkedHashSet<String>();   // keys, in the order tapped
+        final AlertDialog[] holder = new AlertDialog[1];
+
+        LinearLayout box = Ui.col(a);
+        int p = Ui.dp(a, 14);
+        box.setPadding(p, Ui.dp(a, 6), p, 0);
+
+        // search and sort, side by side
+        LinearLayout tools = Ui.row(a);
+        final EditText search = new EditText(a);
+        search.setHint("Search");
+        search.setSingleLine(true);
+        search.setTextSize(13);
+        search.setTextColor(Ui.TXT);
+        search.setHintTextColor(Ui.DIM);
+        search.setBackground(Ui.rrs(a, Ui.FIELD, Ui.LINE, Ui.RAD_BTN, Ui.STROKE_W));
+        int sp = Ui.dp(a, 10);
+        search.setPadding(sp, sp, sp, sp);
+        search.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        tools.addView(search);
+
+        final LinearLayout list = Ui.col(a);
+        final TextView countLabel = Ui.tv(a, "", 11.5f, Ui.DIM, false);
+
+        final Runnable[] fill = new Runnable[1];
+
+        tools.addView(Ui.iconBtn(a, Ico.LIST, Ui.DIM, 16, "Sort", new View.OnClickListener() {
+            public void onClick(View v) {
+                Ui.dialog(a).setTitle("Sort").setItems(Store.SORTS, new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int which) {
+                        prefs.librarySort(which);
+                        fill[0].run();
+                    }
+                }).show();
+            }
+        }));
+        box.addView(tools);
+
+        Ui.margin(a, countLabel, 2, 6, 0, 6);
+        box.addView(countLabel);
+
+        ScrollView scroll = new ScrollView(a);
+        int height = (int) (a.getResources().getDisplayMetrics().heightPixels * 0.52f);
+        scroll.setLayoutParams(Ui.lp(Ui.MATCH, height));
+        scroll.addView(list, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
+        box.addView(scroll);
+        box.addView(Ui.gap(a, 8));
+
+        fill[0] = new Runnable() {
+            public void run() {
+                list.removeAllViews();
+                List<Track> view = Store.view(prefs.librarySort(), filter[0]);
+
+                String sortName = Store.SORTS[Math.max(0, Math.min(prefs.librarySort(),
+                        Store.SORTS.length - 1))].toLowerCase();
+                if (choosing[0]) {
+                    countLabel.setText(chosen.size() + " selected  .  tap to add or remove");
+                } else if (allowMultiple) {
+                    countLabel.setText(view.size() + " of " + Store.LIB.size() + "  .  " + sortName
+                            + "  .  hold a row to pick several");
+                } else {
+                    countLabel.setText(view.size() + " of " + Store.LIB.size() + "  .  " + sortName);
+                }
+
+                if (view.isEmpty()) {
+                    list.addView(Ui.tv(a, "Nothing matches that.", 13, Ui.DIM, false));
+                    return;
+                }
+                for (int i = 0; i < view.size(); i++) {
+                    list.addView(row(a, view.get(i), allowMultiple, choosing, chosen, holder, cb, fill[0]));
+                }
+            }
+        };
+
+        search.addTextChangedListener(new TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int x, int y, int z) { }
+            public void onTextChanged(CharSequence s, int x, int y, int z) { }
+            public void afterTextChanged(Editable e) {
+                filter[0] = e.toString();
+                fill[0].run();
+            }
+        });
+        fill[0].run();
+
+        AlertDialog.Builder b = Ui.dialog(a).setTitle(title).setView(box)
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("Manage tracks", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) {
+                        a.startActivity(new Intent(a, LibraryActivity.class));
+                    }
+                });
+        if (allowMultiple) {
+            b.setPositiveButton("Add selected", new DialogInterface.OnClickListener() {
+                public void onClick(DialogInterface d, int w) {
+                    List<Track> out = new ArrayList<Track>();
+                    for (String key : chosen) {
+                        Track t = Store.byKey(key);
+                        if (t != null) out.add(t);
+                    }
+                    if (out.isEmpty()) Ui.toast(a, "Nothing was selected");
+                    else cb.picked(out);
+                }
+            });
+        }
+        holder[0] = b.create();
+        holder[0].show();
+    }
+
+    private static View row(final Activity a, final Track t, final boolean allowMultiple,
+                            final boolean[] choosing, final Set<String> chosen,
+                            final AlertDialog[] holder, final OnPicked cb, final Runnable again) {
+        final String key = t.key();
+        final boolean selected = chosen.contains(key);
+
+        LinearLayout r = Ui.row(a);
+        r.setBackground(Ui.ripple(selected
+                ? Ui.rrs(a, Ui.ACC_SOFT, Ui.ACC_TXT, Ui.RAD_BTN, 1.2f)
+                : Ui.rr(a, Ui.SURF2, Ui.RAD_BTN)));
+        r.setPadding(Ui.dp(a, 6), Ui.dp(a, 9), Ui.dp(a, 12), Ui.dp(a, 9));
+        Ui.margin(a, r, 0, 0, 0, 6);
+
+        // the icon is its own target: tapping it starts a multiple selection
+        View mark = Ui.iconBtn(a, selected ? Ico.CHECK : Ico.NOTE,
+                selected ? Ui.ACC_TXT : Ui.DIM, 16,
+                selected ? "Selected" : "Select this track", new View.OnClickListener() {
+            public void onClick(View v) {
+                if (!allowMultiple) return;
+                Ui.buzz(v);
+                choosing[0] = true;
+                if (!chosen.remove(key)) chosen.add(key);
+                again.run();
+            }
+        });
+        r.addView(mark);
+
+        LinearLayout col = Ui.col(a);
+        col.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        TextView name = Ui.tv(a, t.shortTitle(), 14, Ui.TXT, false);
+        Ui.ellipsize(name);
+        col.addView(name);
+        col.addView(Ui.tv(a, (t.durMs > 0 ? Fmt.ms(t.durMs) : "length unknown")
+                + (t.isVideo() ? "  .  video, audio only" : ""), 11, Ui.DIM, false));
+        r.addView(col);
+
+        r.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                if (allowMultiple && choosing[0]) {
+                    if (!chosen.remove(key)) chosen.add(key);
+                    again.run();
+                    return;
+                }
+                List<Track> one = new ArrayList<Track>();
+                one.add(t);
+                if (holder[0] != null) holder[0].dismiss();
+                cb.picked(one);
+            }
+        });
+        r.setOnLongClickListener(new View.OnLongClickListener() {
+            public boolean onLongClick(View v) {
+                if (!allowMultiple) return false;
+                Ui.buzz(v);
+                choosing[0] = true;
+                if (!chosen.remove(key)) chosen.add(key);
+                again.run();
+                return true;
+            }
+        });
+        return r;
+    }
+}
+'@
+
+# ---------------------------------------------------------------------------
 # Java: home screen (saved programs)
 # ---------------------------------------------------------------------------
 Write-Src "$PKG_PATH\MainActivity.java" @'
@@ -4484,8 +4670,6 @@ package com.riola.player;
 import android.app.Activity;
 import android.content.DialogInterface;
 import android.content.Intent;
-import android.content.pm.PackageManager;
-import android.os.Build;
 import android.os.Bundle;
 import android.view.View;
 import android.view.WindowManager;
@@ -5409,22 +5593,35 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
                     return;
                 }
                 final boolean section = which == 1;
-                Pickers.track(EditorActivity.this, section ? "Section of which track?" : "Which track?",
-                        new Pickers.OnTrack() {
-                    public void picked(Track t) {
-                        Step s;
+                // a section is one slice of one track, but plain tracks can be
+                // added by the handful
+                TrackPicker.show(EditorActivity.this,
+                        section ? "Section of which track?" : "Which tracks?",
+                        !section, new TrackPicker.OnPicked() {
+                    public void picked(java.util.List<Track> picked) {
+                        if (picked.isEmpty()) return;
                         if (section) {
+                            Track t = picked.get(0);
                             long end = t.durMs > 45000 ? 45000 : Math.max(10000, t.durMs);
                             long from = end > 20000 ? 15000 : 0;
-                            s = Step.section(t, from, end);
+                            Step s = Step.section(t, from, end);
                             s.times = 4;
-                        } else {
-                            s = Step.play(t);
+                            int where = place(s, at);
+                            save();
+                            refresh();
+                            edit(where);
+                            return;
                         }
-                        int where = place(s, at);
+                        int where = -1;
+                        int insertAt = at;
+                        for (int i = 0; i < picked.size(); i++) {
+                            where = place(Step.play(picked.get(i)), insertAt);
+                            if (insertAt >= 0) insertAt = where + 1;
+                        }
                         save();
                         refresh();
-                        edit(where);
+                        if (picked.size() == 1) edit(where);
+                        else Ui.toast(EditorActivity.this, picked.size() + " steps added");
                     }
                 });
             }
@@ -5885,13 +6082,6 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
     private String filter = "";
     private android.widget.EditText search;
 
-    /** Manual keeps whatever order you dragged things into. */
-    private static final String[] SORTS = {
-        "Manual order", "Name A to Z", "Name Z to A",
-        "Recently added", "Oldest added", "Newest file", "Oldest file",
-        "Longest first", "Shortest first"
-    };
-
     @Override
     protected void onCreate(Bundle saved) {
         prefs = new Prefs(this);
@@ -5988,7 +6178,7 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
 
     private void refresh() {
         int n = Store.LIB.size();
-        String sortName = SORTS[Math.max(0, Math.min(prefs.librarySort(), SORTS.length - 1))];
+        String sortName = Store.SORTS[Math.max(0, Math.min(prefs.librarySort(), Store.SORTS.length - 1))];
         subtitle.setText(n == 0 ? "nothing added yet"
                 : (n + (n == 1 ? " track" : " tracks") + "  .  " + sortName.toLowerCase()));
         if (search != null) search.setVisibility(n > 8 ? View.VISIBLE : View.GONE);
@@ -6000,7 +6190,7 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
             return;
         }
 
-        List<Track> view = ordered();
+        List<Track> view = Store.view(prefs.librarySort(), filter);
         if (view.isEmpty()) {
             listBox.addView(Ui.tv(this, "Nothing matches \"" + filter + "\".", 13, Ui.DIM, false));
             return;
@@ -6008,35 +6198,8 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
         for (int i = 0; i < view.size(); i++) listBox.addView(row(view.get(i)));
     }
 
-    /** The library filtered and sorted for display; the stored order is untouched. */
-    private List<Track> ordered() {
-        List<Track> view = new ArrayList<Track>();
-        for (Track t : Store.LIB) {
-            if (filter.length() == 0 || t.shortTitle().toLowerCase().contains(filter)) view.add(t);
-        }
-        final int mode = prefs.librarySort();
-        if (mode == 0) return view;
-        Collections.sort(view, new Comparator<Track>() {
-            public int compare(Track a, Track b) {
-                switch (mode) {
-                    case 1: return a.shortTitle().compareToIgnoreCase(b.shortTitle());
-                    case 2: return b.shortTitle().compareToIgnoreCase(a.shortTitle());
-                    case 3: return cmp(b.addedAt, a.addedAt);
-                    case 4: return cmp(a.addedAt, b.addedAt);
-                    case 5: return cmp(b.modifiedAt, a.modifiedAt);
-                    case 6: return cmp(a.modifiedAt, b.modifiedAt);
-                    case 7: return cmp(b.durMs, a.durMs);
-                    default: return cmp(a.durMs, b.durMs);
-                }
-            }
-        });
-        return view;
-    }
-
-    private static int cmp(long a, long b) { return a == b ? 0 : (a < b ? -1 : 1); }
-
     private void sortMenu() {
-        Ui.dialog(this).setTitle("Sort the library").setItems(SORTS,
+        Ui.dialog(this).setTitle("Sort the library").setItems(Store.SORTS,
                 new DialogInterface.OnClickListener() {
             public void onClick(DialogInterface d, int which) {
                 prefs.librarySort(which);
@@ -6441,7 +6604,6 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
-import android.widget.Switch;
 import android.widget.TextView;
 
 /** Listen to the track and mark A and B by ear. */
