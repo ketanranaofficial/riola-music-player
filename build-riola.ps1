@@ -1020,6 +1020,10 @@ public final class Ui {
 
     public static boolean dark = true;
     public static int BG, SURF, SURF2, LINE, TXT, DIM, ACC, ACC2, RED, GREEN, AMBER, RIPPLE, ONACC, FIELD;
+    /** The accent, nudged until it is legible as text on a card. */
+    public static int ACC_TXT;
+    /** The accent at a whisper, for the highlight behind the playing step. */
+    public static int ACC_SOFT;
 
     /** Colours offered in settings. Any other colour can be mixed by hand. */
     public static final int[] ACCENTS = {
@@ -1136,11 +1140,46 @@ public final class Ui {
                 if (isDark) {
                     BG = 0xFF080B14; SURF = 0xFF101528; SURF2 = 0xFF171E36; LINE = 0xFF2A3358;
                     TXT = 0xFFEDF1FF; DIM = 0xFF8E9AC6; FIELD = 0xFF070A12;
+                } else {
+                    BG = 0xFFF2F4FF; SURF = 0xFFFFFFFF; SURF2 = 0xFFEAEDFB; LINE = 0xFFC9D0F0;
+                    TXT = 0xFF141833; DIM = 0xFF5F6790; FIELD = 0xFFF8F9FF;
                 }
                 break;
             default:
                 break;
         }
+
+        // Only now are the surfaces final, so the legible accent has to be
+        // worked out here rather than above: a pale accent is invisible on a
+        // white card, and a dark one vanishes on a black one.
+        ACC_TXT = readable(ACC, SURF, isDark);
+        ACC_SOFT = blend(ACC, SURF, isDark ? 0.20f : 0.14f);
+    }
+
+    /** Lighten or darken the accent until it stands off the surface behind it. */
+    private static int readable(int accent, int surface, boolean isDark) {
+        float[] hsv = new float[3];
+        android.graphics.Color.colorToHSV(accent, hsv);
+        int c = accent;
+        for (int i = 0; i < 30 && contrast(c, surface) < 3.4f; i++) {
+            hsv[2] = isDark ? Math.min(1f, hsv[2] + 0.035f) : Math.max(0.12f, hsv[2] - 0.035f);
+            if (isDark && hsv[1] > 0.18f) hsv[1] = Math.max(0.18f, hsv[1] - 0.012f);
+            c = android.graphics.Color.HSVToColor(hsv);
+        }
+        return c;
+    }
+
+    private static float contrast(int a, int b) {
+        float la = luminance(a), lb = luminance(b);
+        float hi = Math.max(la, lb), lo = Math.min(la, lb);
+        return (hi + 0.05f) / (lo + 0.05f);
+    }
+
+    public static int blend(int fg, int bg, float amount) {
+        int r = (int) (((fg >> 16) & 0xFF) * amount + ((bg >> 16) & 0xFF) * (1 - amount));
+        int g = (int) (((fg >> 8) & 0xFF) * amount + ((bg >> 8) & 0xFF) * (1 - amount));
+        int b = (int) ((fg & 0xFF) * amount + (bg & 0xFF) * (1 - amount));
+        return 0xFF000000 | (r << 16) | (g << 8) | b;
     }
 
     /** A companion colour for the accent, used for small marks. */
@@ -1307,7 +1346,7 @@ public final class Ui {
     public static LinearLayout heading(Context c, int icoId, String text) {
         LinearLayout r = row(c);
         if (icoId > 0) {
-            r.addView(icon(c, icoId, ACC, 16));
+            r.addView(icon(c, icoId, ACC_TXT, 16));
             r.addView(hgap(c, 8));
         }
         TextView t = tv(c, CAPS_HEADINGS ? text.toUpperCase() : text, 12, DIM, true);
@@ -1531,7 +1570,7 @@ public final class Ui {
         TextView t = tv(c, label, 14, TXT, false);
         t.setLayoutParams(lpw(0, WRAP, 1f));
         head.addView(t);
-        final TextView val = mono(c, value + unit, 12, ACC);
+        final TextView val = mono(c, value + unit, 12, ACC_TXT);
         head.addView(val);
 
         final SeekBar s = new SeekBar(c);
@@ -2108,7 +2147,7 @@ public final class Themes {
             LinearLayout r = Ui.row(a);
             r.setPadding(Ui.dp(a, 12), Ui.dp(a, 11), Ui.dp(a, 12), Ui.dp(a, 11));
             r.setBackground(Ui.ripple(i == current
-                    ? Ui.rrs(a, Ui.SURF2, Ui.ACC, Ui.RAD_BTN, 1.4f)
+                    ? Ui.rrs(a, Ui.SURF2, Ui.ACC_TXT, Ui.RAD_BTN, 1.4f)
                     : Ui.rr(a, Ui.SURF2, Ui.RAD_BTN)));
             Ui.margin(a, r, 0, 0, 0, 6);
             LinearLayout col = Ui.col(a);
@@ -2116,7 +2155,7 @@ public final class Themes {
             col.addView(Ui.tv(a, Ui.STYLE_NAMES[i], 15, Ui.TXT, true));
             col.addView(Ui.tv(a, Ui.STYLE_NOTES[i], 11.5f, Ui.DIM, false));
             r.addView(col);
-            if (i == current) r.addView(Ui.icon(a, Ico.CHECK, Ui.ACC, 18));
+            if (i == current) r.addView(Ui.icon(a, Ico.CHECK, Ui.ACC_TXT, 18));
             r.setOnClickListener(new View.OnClickListener() {
                 public void onClick(View v) {
                     Ui.buzz(v);
@@ -3803,7 +3842,7 @@ public final class Pickers {
             r.setBackground(Ui.ripple(Ui.rr(a, Ui.SURF2, 10)));
             r.setPadding(Ui.dp(a, 12), Ui.dp(a, 10), Ui.dp(a, 12), Ui.dp(a, 10));
             Ui.margin(a, r, 0, 0, 0, 6);
-            r.addView(Ui.icon(a, Ico.NOTE, Ui.ACC, 16));
+            r.addView(Ui.icon(a, Ico.NOTE, Ui.ACC_TXT, 16));
             r.addView(Ui.hgap(a, 10));
             LinearLayout col = Ui.col(a);
             col.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
@@ -3855,7 +3894,7 @@ public final class Pickers {
                                      final long[] value, final Runnable again) {
         box.removeAllViews();
 
-        final TextView shown = Ui.tv(a, Fmt.ms(value[0]), 30, Ui.ACC, true);
+        final TextView shown = Ui.tv(a, Fmt.ms(value[0]), 30, Ui.ACC_TXT, true);
         shown.setGravity(Gravity.CENTER);
         shown.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
         box.addView(shown);
@@ -3904,7 +3943,7 @@ public final class Pickers {
         int p = Ui.dp(a, 18);
         box.setPadding(p, Ui.dp(a, 8), p, 0);
 
-        final TextView shown = Ui.tv(a, Fmt.ms(value[0]), 30, Ui.ACC, true);
+        final TextView shown = Ui.tv(a, Fmt.ms(value[0]), 30, Ui.ACC_TXT, true);
         shown.setGravity(Gravity.CENTER);
         shown.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
         box.addView(shown);
@@ -4334,7 +4373,7 @@ public class MainActivity extends Activity implements PlayerBar.Host {
         LinearLayout tr = Ui.row(this);
         tr.setBackground(Ui.ripple(Ui.rr(this, 0x00000000, 12)));
         tr.setPadding(0, Ui.dp(this, 12), 0, Ui.dp(this, 12));
-        tr.addView(Ui.icon(this, Ico.NOTE, Ui.ACC, 18));
+        tr.addView(Ui.icon(this, Ico.NOTE, Ui.ACC_TXT, 18));
         tr.addView(Ui.hgap(this, 12));
         LinearLayout tcol = Ui.col(this);
         tcol.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
@@ -4447,7 +4486,7 @@ public class MainActivity extends Activity implements PlayerBar.Host {
         final boolean playing = eng.isPlaying(p);
 
         LinearLayout r = Ui.row(this);
-        r.setBackground(Ui.ripple(playing ? Ui.rrs(this, Ui.SURF2, Ui.ACC, 14, 1.4f)
+        r.setBackground(Ui.ripple(playing ? Ui.rrs(this, Ui.SURF2, Ui.ACC_TXT, 14, 1.4f)
                                           : Ui.rr(this, Ui.SURF2, 14)));
         r.setPadding(Ui.dp(this, 10), Ui.dp(this, 10), Ui.dp(this, 4), Ui.dp(this, 10));
         Ui.margin(this, r, 0, 0, 0, 8);
@@ -4630,7 +4669,7 @@ public class MainActivity extends Activity implements PlayerBar.Host {
     private void highlight(int active) {
         for (int i = 0; i < liveRows.size(); i++) {
             View v = liveRows.get(i);
-            if (i == active) v.setBackground(Ui.rrs(this, Ui.dark ? 0xFF10202B : 0xFFE3F2FB, Ui.ACC, 10, 1));
+            if (i == active) v.setBackground(Ui.rrs(this, Ui.ACC_SOFT, Ui.ACC_TXT, 10, 1));
             else v.setBackground(Ui.ripple(Ui.rr(this, 0x00000000, 10)));
         }
     }
@@ -4683,7 +4722,7 @@ public class MainActivity extends Activity implements PlayerBar.Host {
         box.setPadding(p, Ui.dp(this, 4), p, 0);
         for (int i = 0; i < HelpText.SECTIONS.length; i++) {
             String[] section = HelpText.SECTIONS[i];
-            TextView h = Ui.tv(this, section[0], 14, Ui.ACC, true);
+            TextView h = Ui.tv(this, section[0], 14, Ui.ACC_TXT, true);
             Ui.margin(this, h, 0, i == 0 ? 0 : 18, 0, 6);
             box.addView(h);
             TextView b = Ui.tv(this, section[1], 13.5f, Ui.TXT, false);
@@ -4915,7 +4954,7 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
         root.setFitsSystemWindows(true);
 
         View[] actions = {
-            Ui.iconBtn(this, Ico.PLAY, Ui.ACC, 20, "Run this program", new View.OnClickListener() {
+            Ui.iconBtn(this, Ico.PLAY, Ui.ACC_TXT, 20, "Run this program", new View.OnClickListener() {
                 public void onClick(View v) { run(0); }
             }),
             Ui.iconBtn(this, Ico.MORE, Ui.DIM, 20, "More options", new View.OnClickListener() {
@@ -5088,8 +5127,8 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
         boolean live = eng.isPlaying(prog) && eng.st.step == index;
 
         LinearLayout r = Ui.row(this);
-        r.setBackground(live ? Ui.rrs(this, Ui.dark ? 0xFF10202B : 0xFFE3F2FB, Ui.ACC, 14, 1.4f)
-                             : Ui.ripple(Ui.rr(this, Ui.SURF2, 14)));
+        r.setBackground(live ? Ui.rrs(this, Ui.ACC_SOFT, Ui.ACC_TXT, Ui.RAD_CARD, 1.4f)
+                             : Ui.ripple(Ui.rr(this, Ui.SURF2, Ui.RAD_CARD)));
         r.setPadding(Ui.dp(this, 8), Ui.dp(this, 9), Ui.dp(this, 2), Ui.dp(this, 9));
         Ui.margin(this, r, 0, 0, 0, 8);
         r.setOnClickListener(new View.OnClickListener() {
@@ -5304,8 +5343,8 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
         for (int i = 0; i < rows.size(); i++) {
             boolean live = mine && s.step == i;
             rows.get(i).setBackground(live
-                    ? Ui.rrs(this, Ui.dark ? 0xFF10202B : 0xFFE3F2FB, Ui.ACC, 14, 1.4f)
-                    : Ui.ripple(Ui.rr(this, Ui.SURF2, 14)));
+                    ? Ui.rrs(this, Ui.ACC_SOFT, Ui.ACC_TXT, Ui.RAD_CARD, 1.4f)
+                    : Ui.ripple(Ui.rr(this, Ui.SURF2, Ui.RAD_CARD)));
         }
         if (mine && s.step != liveRow) {
             liveRow = s.step;
@@ -6118,7 +6157,7 @@ public final class AbDialog {
         int p = Ui.dp(act, 18);
         box.setPadding(p, Ui.dp(act, 6), p, 0);
 
-        final TextView clock = Ui.mono(act, "0:00 / 0:00", 15, Ui.ACC);
+        final TextView clock = Ui.mono(act, "0:00 / 0:00", 15, Ui.ACC_TXT);
         clock.setGravity(Gravity.CENTER);
         clock.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
         box.addView(clock);
@@ -6297,7 +6336,7 @@ public final class AbDialog {
     }
 
     private static View nudge(Activity act, String text, View.OnClickListener l) {
-        TextView t = Ui.tv(act, text, 12, Ui.ACC, true);
+        TextView t = Ui.tv(act, text, 12, Ui.ACC_TXT, true);
         t.setPadding(Ui.dp(act, 10), Ui.dp(act, 8), Ui.dp(act, 10), Ui.dp(act, 8));
         t.setBackground(Ui.ripple(Ui.rrs(act, Ui.SURF2, Ui.LINE, 10, 1)));
         t.setOnClickListener(l);
@@ -6419,7 +6458,7 @@ public class NowPlayingActivity extends Activity implements Engine.Listener {
         Ui.margin(this, stepDetail, 0, 8, 0, 0);
         body.addView(stepDetail);
 
-        clock = Ui.mono(this, "0:00", 40, Ui.ACC);
+        clock = Ui.mono(this, "0:00", 40, Ui.ACC_TXT);
         clock.setGravity(Gravity.CENTER);
         clock.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
         Ui.margin(this, clock, 0, 26, 0, 0);
