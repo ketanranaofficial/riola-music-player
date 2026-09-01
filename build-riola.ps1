@@ -422,6 +422,9 @@ public class Track {
     public long durMs;
     /** Which audio stream to play, for files that carry more than one. -1 = whatever the file defaults to. */
     public int audioTrack = -1;
+    /** When it was added to the library, and the file's own date if we could read it. */
+    public long addedAt;
+    public long modifiedAt;
 
     public Track(String uri, String title, long durMs) {
         this.uri = uri;
@@ -440,6 +443,20 @@ public class Track {
             ".3gp", ".ts", ".flv", ".wmv", ".mpg", ".mpeg" };
 
     public Uri toUri() { return Uri.parse(uri); }
+
+    /**
+     * Identity that does not depend on how the file was picked. The same file
+     * has one uri when chosen with Add files and another when found by
+     * scanning a folder, but both carry the same provider and document id.
+     */
+    public String key() {
+        try {
+            Uri u = toUri();
+            String id = android.provider.DocumentsContract.getDocumentId(u);
+            if (id != null && id.length() > 0) return u.getAuthority() + "|" + id;
+        } catch (Exception e) { /* not a document uri; fall back to the whole thing */ }
+        return uri;
+    }
 
     /**
      * The name without its file extension. Only a known audio extension is
@@ -527,7 +544,11 @@ public class Step {
 
     public boolean needsTrack() { return type == PLAY || type == SECTION; }
 
-    public Track track() { return needsTrack() ? Store.byUri(trackUri) : null; }
+    public Track track() {
+        if (!needsTrack()) return null;
+        Track t = Store.byUri(trackUri);
+        return t;
+    }
 
     /** Gone from the library, or the file itself could not be opened last time we looked. */
     public boolean missing() {
@@ -778,6 +799,8 @@ public class Prefs {
     public int     accent()        { return sp.getInt("accent", Ui.ACCENTS[0]); }
     public void    accent(int v)   { sp.edit().putInt("accent", v).apply(); }
     public int     style()         { return sp.getInt("style", Ui.STYLE_MATERIAL); }
+    public int     librarySort()   { return sp.getInt("libsort", 0); }
+    public void    librarySort(int v) { sp.edit().putInt("libsort", v).apply(); }
     public void    style(int v)    { sp.edit().putInt("style", v).apply(); }
     public boolean notifNagged()   { return sp.getBoolean("notifnag", false); }
     public void    notifNagged(boolean v) { sp.edit().putBoolean("notifnag", v).apply(); }
@@ -853,9 +876,12 @@ public final class Store {
                 JSONObject o = arr.getJSONObject(i);
                 Track t = new Track(o.getString("u"), o.optString("t", "track"), o.optLong("d", 0));
                 t.audioTrack = o.optInt("a", -1);
+                t.addedAt = o.optLong("ad", 0);
+                t.modifiedAt = o.optLong("md", 0);
                 LIB.add(t);
             }
         } catch (Exception e) { LIB.clear(); }
+        dedupe();
         try {
             JSONArray arr = new JSONArray(sp(c).getString("programs", "[]"));
             for (int i = 0; i < arr.length(); i++) {
@@ -867,6 +893,25 @@ public final class Store {
     }
 
     // ---- library ---------------------------------------------------------
+    /**
+     * One entry per real file. Older versions keyed only on the exact uri, so a
+     * file added twice through different routes could sit in the list twice.
+     */
+    public static void dedupe() {
+        java.util.HashSet<String> seen = new java.util.HashSet<String>();
+        List<Track> keep = new java.util.ArrayList<Track>();
+        for (Track t : LIB) if (seen.add(t.key())) keep.add(t);
+        if (keep.size() == LIB.size()) return;
+        LIB.clear();
+        LIB.addAll(keep);
+    }
+
+    /** Finds a track however its uri happens to be spelled. */
+    public static Track byKey(String key) {
+        for (Track t : LIB) if (t.key().equals(key)) return t;
+        return null;
+    }
+
     public static Track byUri(String uri) {
         if (uri == null || uri.length() == 0) return null;
         for (Track t : LIB) if (uri.equals(t.uri)) return t;
@@ -910,6 +955,8 @@ public final class Store {
                 o.put("t", t.title);
                 o.put("d", t.durMs);
                 o.put("a", t.audioTrack);
+                o.put("ad", t.addedAt);
+                o.put("md", t.modifiedAt);
                 arr.put(o);
             } catch (Exception e) { /* skip this one */ }
         }
@@ -1036,9 +1083,12 @@ public final class Ui {
     };
 
     public static final int STYLE_MATERIAL = 0, STYLE_ELEGANT = 1, STYLE_RETRO = 2,
-                            STYLE_CODER = 3, STYLE_98 = 4, STYLE_FUTURE = 5;
+                            STYLE_CODER = 3, STYLE_98 = 4, STYLE_FUTURE = 5,
+                            STYLE_NEON = 6, STYLE_PASTEL = 7, STYLE_BRUTAL = 8,
+                            STYLE_MINIMAL = 9;
     public static final String[] STYLE_NAMES = {
-        "Material", "Elegant", "Retro", "Coder", "98", "Futuristic"
+        "Material", "Elegant", "Retro", "Coder", "98", "Futuristic",
+        "Neon", "Pastel", "Brutalist", "Minimal"
     };
     public static final String[] STYLE_NOTES = {
         "Soft corners and quiet lines. The default.",
@@ -1046,7 +1096,11 @@ public final class Ui {
         "Warm paper, heavy borders, chunky type.",
         "Monospace everything and square corners.",
         "Grey panels and hard edges, like an old desktop.",
-        "Wide letter spacing and very round shapes."
+        "Wide letter spacing and very round shapes.",
+        "Deep night, bright edges, everything glowing.",
+        "Soft and quiet. Easy on the eyes late at night.",
+        "Stark and heavy. Thick black rules, nothing soft.",
+        "No borders at all. Space does the work."
     };
 
     // metrics the look controls
@@ -1145,6 +1199,54 @@ public final class Ui {
                     TXT = 0xFF141833; DIM = 0xFF5F6790; FIELD = 0xFFF8F9FF;
                 }
                 break;
+            case STYLE_NEON:
+                RAD_CARD = 20; RAD_BTN = 16; RAD_CHIP = 22; STROKE_W = 1.3f;
+                TRACK_SP = 0.14f; ICON_W = 1.7f; PAD = 1f;
+                if (isDark) {
+                    BG = 0xFF05060C; SURF = 0xFF0B0F1C; SURF2 = 0xFF121A2E; LINE = 0xFF2C3C6E;
+                    TXT = 0xFFE9F1FF; DIM = 0xFF7C8CC4; FIELD = 0xFF04050A;
+                } else {
+                    BG = 0xFF11131C; SURF = 0xFF1A1E2C; SURF2 = 0xFF232838; LINE = 0xFF3C4A78;
+                    TXT = 0xFFF0F3FF; DIM = 0xFF98A2C0; FIELD = 0xFF0F111A;
+                }
+                break;
+            case STYLE_PASTEL:
+                RAD_CARD = 22; RAD_BTN = 18; RAD_CHIP = 24; STROKE_W = 0.9f;
+                TRACK_SP = 0.03f; ICON_W = 1.6f; PAD = 1.15f;
+                CAPS_HEADINGS = false;
+                if (isDark) {
+                    BG = 0xFF191625; SURF = 0xFF221E31; SURF2 = 0xFF2C2740; LINE = 0xFF3F3857;
+                    TXT = 0xFFEDE7FA; DIM = 0xFFA79CC4; FIELD = 0xFF15121F;
+                } else {
+                    BG = 0xFFFAF7FF; SURF = 0xFFFFFFFF; SURF2 = 0xFFF3EDFB; LINE = 0xFFE3D9F2;
+                    TXT = 0xFF3B3350; DIM = 0xFF8B82A6; FIELD = 0xFFFDFBFF;
+                }
+                break;
+            case STYLE_BRUTAL:
+                RAD_CARD = 0; RAD_BTN = 0; RAD_CHIP = 0; STROKE_W = 3.2f;
+                TRACK_SP = 0.02f; ICON_W = 2.8f; PAD = 1f;
+                SQUARE_ICONS = true;
+                FONT_BOLD = Typeface.DEFAULT_BOLD;
+                if (isDark) {
+                    BG = 0xFF000000; SURF = 0xFF0B0B0B; SURF2 = 0xFF141414; LINE = 0xFFFFFFFF;
+                    TXT = 0xFFFFFFFF; DIM = 0xFFA8A8A8; FIELD = 0xFF000000;
+                } else {
+                    BG = 0xFFFFFFFF; SURF = 0xFFFFFFFF; SURF2 = 0xFFF2F2F2; LINE = 0xFF000000;
+                    TXT = 0xFF000000; DIM = 0xFF444444; FIELD = 0xFFFFFFFF;
+                }
+                break;
+            case STYLE_MINIMAL:
+                RAD_CARD = 10; RAD_BTN = 8; RAD_CHIP = 12; STROKE_W = 0f;
+                TRACK_SP = 0.06f; ICON_W = 1.4f; PAD = 1.25f;
+                CAPS_HEADINGS = false;
+                if (isDark) {
+                    BG = 0xFF101215; SURF = 0xFF16191D; SURF2 = 0xFF1C2025; LINE = 0xFF262B31;
+                    TXT = 0xFFE6E9EC; DIM = 0xFF8B9299; FIELD = 0xFF0D0F12;
+                } else {
+                    BG = 0xFFFBFBFC; SURF = 0xFFFFFFFF; SURF2 = 0xFFF4F5F7; LINE = 0xFFE8EAED;
+                    TXT = 0xFF1B1E22; DIM = 0xFF6B7278; FIELD = 0xFFFFFFFF;
+                }
+                break;
             default:
                 break;
         }
@@ -1234,7 +1336,7 @@ public final class Ui {
 
     public static GradientDrawable rrs(Context c, int fill, int stroke, float radDp, float wDp) {
         GradientDrawable g = rr(c, fill, radDp);
-        g.setStroke(Math.max(1, dp(c, wDp)), stroke);
+        if (wDp > 0f) g.setStroke(Math.max(1, dp(c, wDp)), stroke);
         return g;
     }
 
@@ -1712,7 +1814,7 @@ public class Ico extends Drawable {
             NOTE = 14, AB = 15, CHECK = 16, CLOSE = 17, UP = 18, DOWN = 19, CLOCK = 20,
             LIST = 21, WAVE = 22, EDIT = 23, SCISSOR = 24, MORE = 25, BACK = 26, RIGHT = 27,
             SEARCH = 28, COPY = 29, MINUS = 30, DRAG = 31, PROGRAM = 32, MOON = 33,
-            RESET = 34, BELL = 35;
+            RESET = 34, BELL = 35, SHUFFLE = 36;
 
     private final int id;
     private int color;
@@ -1912,6 +2014,13 @@ public class Ico extends Drawable {
             case COPY:
                 box(cv, ox, oy, u, 8f, 8f, 20f, 20f, 2.4f);
                 poly(cv, ox, oy, u, false, 16f, 5f, 4.5f, 5f, 4.5f, 16f);
+                break;
+            case SHUFFLE:
+                poly(cv, ox, oy, u, false, 3f, 7f, 8f, 7f, 16f, 17f, 21f, 17f);
+                poly(cv, ox, oy, u, false, 3f, 17f, 8f, 17f, 16f, 7f, 21f, 7f);
+                p.setStyle(Paint.Style.FILL);
+                poly(cv, ox, oy, u, true, 18f, 4f, 22f, 7f, 18f, 10f);
+                poly(cv, ox, oy, u, true, 18f, 14f, 22f, 17f, 18f, 20f);
                 break;
             case RESET:
                 r.set(ox + 4.5f * u, oy + 4.5f * u, ox + 19.5f * u, oy + 19.5f * u);
@@ -2464,6 +2573,7 @@ public class Engine {
         public int  loopTotal = 1;       // -1 = forever
         public int  countIn = -1;        // seconds left before the first step
         public int  skipped;             // steps passed over because the track was gone
+        public boolean shuffled;         // playing in a random order
     }
 
     public interface Listener {
@@ -2498,7 +2608,9 @@ public class Engine {
     private volatile boolean stopReq, paused, running, completed, pushPending;
     private volatile int skip;          // -1 previous step, +1 next step, 2 jump
     private volatile int jump = -1;
-    private volatile int idx;
+    private volatile int idx;           // a position in order[], not a step number
+    private volatile int[] order;
+    private volatile boolean shuffled;
     private volatile int gen;           // run id, so a restart cannot fire the old "finished"
     private volatile float duck = 1f;
     private volatile float gain = 1f;   // fade envelope
@@ -2564,7 +2676,12 @@ public class Engine {
         gain = 1f;
         stepVol = 1f;
         stepSpeed = 1f;
+        buildOrder(shuffled, -1);
         idx = from;
+        if (shuffled) {
+            for (int i = 0; i < order.length; i++) if (order[i] == from) { idx = i; break; }
+        }
+        st.shuffled = shuffled;
         stopReq = false;
         paused = false;
         skip = 0;
@@ -2632,14 +2749,60 @@ public class Engine {
     public void next()        { if (running) { skip = 1;  wake(); } }
     public void prev()        { if (running) { skip = -1; wake(); } }
 
-    public void jumpTo(int i) {
-        if (running && i >= 0 && i < steps.size()) { jump = i; skip = 2; wake(); }
+    /** Takes a step number and finds where it sits in the order being played. */
+    public void jumpTo(int stepIndex) {
+        if (!running || stepIndex < 0 || stepIndex >= steps.size()) return;
+        int at = stepIndex;
+        int[] o = order;
+        if (o != null) {
+            for (int i = 0; i < o.length; i++) if (o[i] == stepIndex) { at = i; break; }
+        }
+        jump = at;
+        skip = 2;
+        wake();
     }
 
     public void seekTo(int ms) {
         MediaPlayer m = mp;
         if (m == null) return;
         try { m.seekTo(ms); } catch (IllegalStateException e) { /* ignore */ }
+    }
+
+    public boolean isShuffled() { return shuffled; }
+
+    /**
+     * Play the steps in a random order. The step that is playing stays put and
+     * everything after it is reshuffled, so turning it on does not cut off what
+     * you are listening to. The program itself is never rewritten.
+     */
+    public void setShuffle(boolean on) {
+        shuffled = on;
+        st.shuffled = on;
+        if (!running || order == null) { push(); return; }
+        int current = (idx >= 0 && idx < order.length) ? order[idx] : 0;
+        buildOrder(on, current);
+        idx = on ? 0 : current;
+        log(on ? "shuffled" : "back to the written order");
+        push();
+    }
+
+    private void buildOrder(boolean shuffle, int keepFirst) {
+        int n = steps.size();
+        int[] o = new int[n];
+        for (int i = 0; i < n; i++) o[i] = i;
+        if (shuffle && n > 1) {
+            java.util.Random r = new java.util.Random();
+            for (int i = n - 1; i > 0; i--) {
+                int j = r.nextInt(i + 1);
+                int t = o[i]; o[i] = o[j]; o[j] = t;
+            }
+            if (keepFirst >= 0) {
+                for (int i = 0; i < n; i++) {
+                    if (o[i] == keepFirst) { int t = o[0]; o[0] = o[i]; o[i] = t; break; }
+                }
+            }
+        }
+        order = o;
     }
 
     public void setDuck(float d) { duck = d; applyVol(); }
@@ -2655,10 +2818,12 @@ public class Engine {
         int playedThisPass = 0;
         while (!stopReq) {
             if (expired()) break;
-            if (idx >= steps.size()) {
+            if (order == null || idx >= order.length) {
                 pass++;
                 if (playedThisPass == 0) break;                 // nothing runnable, do not spin
                 if (loops >= 0 && pass >= Math.max(1, loops)) break;
+                // a fresh shuffle each time round, which is what a playlist does
+                if (shuffled) buildOrder(true, -1);
                 idx = 0;
                 playedThisPass = 0;
                 st.loopDone = pass;
@@ -2666,11 +2831,12 @@ public class Engine {
                 continue;
             }
             if (idx < 0) idx = 0;
-            Step s = steps.get(idx);
+            int stepAt = order[idx];
+            Step s = steps.get(stepAt);
             if (!s.enabled) { idx++; continue; }
 
             playedThisPass++;
-            st.step = idx;
+            st.step = stepAt;
             st.steps = steps.size();
             st.stepTitle = s.title();
             st.stepDetail = s.detail();
@@ -3432,6 +3598,7 @@ public class PlayerBar implements Engine.Listener {
     private final TextView title, detail, badge, time, remain;
     private final SeekBar seek;
     private final ImageView play;
+    private ImageView shuffle;
     private boolean dragging;
 
     public PlayerBar(final Activity a, Host h) {
@@ -3502,6 +3669,11 @@ public class PlayerBar implements Engine.Listener {
         LinearLayout tr = Ui.row(a);
         tr.setGravity(Gravity.CENTER);
         Ui.margin(a, tr, 0, 6, 0, 0);
+        shuffle = Ui.roundBtn(a, Ico.SHUFFLE, 18, false, "Shuffle", new View.OnClickListener() {
+            public void onClick(View v) { Ui.buzz(v); askShuffle(a, eng); }
+        });
+        tr.addView(shuffle);
+        tr.addView(Ui.hgap(a, 10));
         tr.addView(Ui.roundBtn(a, Ico.PREV, 20, false, "Previous step", new View.OnClickListener() {
             public void onClick(View v) { Ui.buzz(v); eng.prev(); }
         }));
@@ -3572,9 +3744,37 @@ public class PlayerBar implements Engine.Listener {
 
         Ui.setIcon(play, s.paused ? Ico.PLAY : Ico.PAUSE, Ui.ONACC);
         play.setContentDescription(s.paused ? "Resume" : "Pause");
+        if (shuffle != null) {
+            Ui.setIcon(shuffle, Ico.SHUFFLE, s.shuffled ? Ui.ACC_TXT : Ui.TXT);
+            shuffle.setContentDescription(s.shuffled ? "Shuffling, tap to stop" : "Shuffle");
+        }
     }
 
     private String append(String a, String b) { return a.length() == 0 ? b : (a + "  .  " + b); }
+
+    /**
+     * Turning shuffle on is worth a question - someone poking the unfamiliar
+     * icon should not silently lose the order they built. Turning it off is
+     * not, because that is the safe direction.
+     */
+    static void askShuffle(final android.app.Activity a, final Engine eng) {
+        if (eng.isShuffled()) {
+            eng.setShuffle(false);
+            Ui.toast(a, "Back to the order you built");
+            return;
+        }
+        Ui.dialog(a).setTitle("Shuffle the steps?")
+                .setMessage("The steps will play in a random order instead of the order you built, "
+                        + "and a new order is drawn each time the program repeats.\n\n"
+                        + "Your program is not changed, and you can switch back at any time.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Shuffle", new android.content.DialogInterface.OnClickListener() {
+                    public void onClick(android.content.DialogInterface d, int w) {
+                        eng.setShuffle(true);
+                        Ui.toast(a, "Playing in a random order");
+                    }
+                }).show();
+    }
 
     // ---- engine callbacks ------------------------------------------------
     public void onState(Engine.St s) {
@@ -5682,6 +5882,15 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
     private PlayerBar bar;
     private LinearLayout listBox;
     private TextView subtitle;
+    private String filter = "";
+    private android.widget.EditText search;
+
+    /** Manual keeps whatever order you dragged things into. */
+    private static final String[] SORTS = {
+        "Manual order", "Name A to Z", "Name Z to A",
+        "Recently added", "Oldest added", "Newest file", "Oldest file",
+        "Longest first", "Shortest first"
+    };
 
     @Override
     protected void onCreate(Bundle saved) {
@@ -5736,10 +5945,35 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
         LinearLayout hd = Ui.heading(this, Ico.LIST, "In the library");
         hd.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
         head.addView(hd);
+        head.addView(Ui.iconBtn(this, Ico.LIST, Ui.DIM, 16, "Sort the library", new View.OnClickListener() {
+            public void onClick(View v) { sortMenu(); }
+        }));
         head.addView(Ui.iconBtn(this, Ico.TRASH, Ui.DIM, 16, "Remove all tracks", new View.OnClickListener() {
             public void onClick(View v) { clearAll(); }
         }));
         card.addView(head);
+
+        search = new android.widget.EditText(this);
+        search.setHint("Search the library");
+        search.setSingleLine(true);
+        search.setTextSize(13);
+        search.setTextColor(Ui.TXT);
+        search.setHintTextColor(Ui.DIM);
+        search.setBackground(Ui.rrs(this, Ui.FIELD, Ui.LINE, Ui.RAD_BTN, Ui.STROKE_W));
+        int sp = Ui.dp(this, 10);
+        search.setPadding(sp, sp, sp, sp);
+        search.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
+        Ui.margin(this, search, 0, 0, 0, 8);
+        search.addTextChangedListener(new android.text.TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int a, int b, int c) { }
+            public void onTextChanged(CharSequence s, int a, int b, int c) { }
+            public void afterTextChanged(android.text.Editable e) {
+                filter = e.toString().trim().toLowerCase();
+                refresh();
+            }
+        });
+        card.addView(search);
+
         listBox = Ui.col(this);
         card.addView(listBox);
         body.addView(card);
@@ -5754,18 +5988,64 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
 
     private void refresh() {
         int n = Store.LIB.size();
-        subtitle.setText(n == 0 ? "nothing added yet" : (n + (n == 1 ? " track" : " tracks")));
+        String sortName = SORTS[Math.max(0, Math.min(prefs.librarySort(), SORTS.length - 1))];
+        subtitle.setText(n == 0 ? "nothing added yet"
+                : (n + (n == 1 ? " track" : " tracks") + "  .  " + sortName.toLowerCase()));
+        if (search != null) search.setVisibility(n > 8 ? View.VISIBLE : View.GONE);
+
         listBox.removeAllViews();
         if (n == 0) {
             listBox.addView(Ui.emptyState(this, Ico.NOTE, "No tracks yet",
                     "Add single files, or point Riola at a folder and it will find the audio inside."));
             return;
         }
-        for (int i = 0; i < n; i++) listBox.addView(row(i));
+
+        List<Track> view = ordered();
+        if (view.isEmpty()) {
+            listBox.addView(Ui.tv(this, "Nothing matches \"" + filter + "\".", 13, Ui.DIM, false));
+            return;
+        }
+        for (int i = 0; i < view.size(); i++) listBox.addView(row(view.get(i)));
     }
 
-    private View row(final int index) {
-        final Track t = Store.LIB.get(index);
+    /** The library filtered and sorted for display; the stored order is untouched. */
+    private List<Track> ordered() {
+        List<Track> view = new ArrayList<Track>();
+        for (Track t : Store.LIB) {
+            if (filter.length() == 0 || t.shortTitle().toLowerCase().contains(filter)) view.add(t);
+        }
+        final int mode = prefs.librarySort();
+        if (mode == 0) return view;
+        Collections.sort(view, new Comparator<Track>() {
+            public int compare(Track a, Track b) {
+                switch (mode) {
+                    case 1: return a.shortTitle().compareToIgnoreCase(b.shortTitle());
+                    case 2: return b.shortTitle().compareToIgnoreCase(a.shortTitle());
+                    case 3: return cmp(b.addedAt, a.addedAt);
+                    case 4: return cmp(a.addedAt, b.addedAt);
+                    case 5: return cmp(b.modifiedAt, a.modifiedAt);
+                    case 6: return cmp(a.modifiedAt, b.modifiedAt);
+                    case 7: return cmp(b.durMs, a.durMs);
+                    default: return cmp(a.durMs, b.durMs);
+                }
+            }
+        });
+        return view;
+    }
+
+    private static int cmp(long a, long b) { return a == b ? 0 : (a < b ? -1 : 1); }
+
+    private void sortMenu() {
+        Ui.dialog(this).setTitle("Sort the library").setItems(SORTS,
+                new DialogInterface.OnClickListener() {
+            public void onClick(DialogInterface d, int which) {
+                prefs.librarySort(which);
+                refresh();
+            }
+        }).show();
+    }
+
+    private View row(final Track t) {
         boolean live = eng.st.running && eng.st.preview && t.uri.equals(eng.st.trackUri);
 
         LinearLayout r = Ui.row(this);
@@ -5794,10 +6074,10 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
         r.addView(col);
 
         r.addView(Ui.iconBtn(this, Ico.MORE, Ui.DIM, 16, "Track options", new View.OnClickListener() {
-            public void onClick(View v) { menu(index); }
+            public void onClick(View v) { menu(Store.LIB.indexOf(t)); }
         }));
         r.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) { menu(index); }
+            public void onClick(View v) { menu(Store.LIB.indexOf(t)); }
         });
         return r;
     }
@@ -5906,6 +6186,10 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
     private void move(int index, int dir) {
         int to = index + dir;
         if (to < 0 || to >= Store.LIB.size()) return;
+        if (prefs.librarySort() != 0) {
+            prefs.librarySort(0);
+            Ui.toast(this, "Switched back to manual order");
+        }
         Track a = Store.LIB.get(index);
         Store.LIB.set(index, Store.LIB.get(to));
         Store.LIB.set(to, a);
@@ -5979,7 +6263,7 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
             int added = 0;
             for (Uri u : uris) {
                 persist(u);
-                if (add(u, displayName(u))) added++;
+                if (add(u, displayName(u), lastModified(u))) added++;
             }
             finishAdding(added);
 
@@ -5996,11 +6280,21 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
         catch (Exception e) { /* some providers do not offer persistable grants */ }
     }
 
-    private boolean add(Uri u, String name) {
+    private boolean add(Uri u, String name) { return add(u, name, 0); }
+
+    /**
+     * The same file has a different uri depending on whether it was picked
+     * directly or found by scanning a folder, so the check is on identity
+     * rather than on the string.
+     */
+    private boolean add(Uri u, String name, long modified) {
         String s = u.toString();
         Store.MISSING.remove(s);      // adding it back clears any earlier failure
-        if (Store.byUri(s) != null) return false;
-        Store.LIB.add(new Track(s, name, 0));
+        Track t = new Track(s, name, 0);
+        if (Store.byKey(t.key()) != null) return false;
+        t.addedAt = System.currentTimeMillis();
+        t.modifiedAt = modified;
+        Store.LIB.add(t);
         return true;
     }
 
@@ -6009,6 +6303,18 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
         refresh();
         Ui.toast(this, added == 0 ? "Nothing new was added" : (added + (added == 1 ? " track added" : " tracks added")));
         readDurations();
+    }
+
+    private long lastModified(Uri u) {
+        Cursor c = null;
+        try {
+            c = getContentResolver().query(u,
+                    new String[]{ DocumentsContract.Document.COLUMN_LAST_MODIFIED },
+                    null, null, null);
+            if (c != null && c.moveToFirst() && !c.isNull(0)) return c.getLong(0);
+        } catch (Exception e) { /* the provider need not offer it */ }
+        finally { if (c != null) c.close(); }
+        return 0;
     }
 
     private String displayName(Uri u) {
@@ -6036,7 +6342,7 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
                     public int compare(Track a, Track b) { return a.title.compareToIgnoreCase(b.title); }
                 });
                 final int[] added = { 0 };
-                for (Track t : found) if (add(Uri.parse(t.uri), t.title)) added[0]++;
+                for (Track t : found) if (add(Uri.parse(t.uri), t.title, t.modifiedAt)) added[0]++;
                 runOnUiThread(new Runnable() {
                     public void run() { finishAdding(added[0]); }
                 });
@@ -6052,14 +6358,19 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
             c = getContentResolver().query(children, new String[]{
                     DocumentsContract.Document.COLUMN_DOCUMENT_ID,
                     DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                    DocumentsContract.Document.COLUMN_MIME_TYPE }, null, null, null);
+                    DocumentsContract.Document.COLUMN_MIME_TYPE,
+                    DocumentsContract.Document.COLUMN_LAST_MODIFIED }, null, null, null);
             if (c == null) return;
             while (c.moveToNext()) {
                 String id = c.getString(0), name = c.getString(1), mime = c.getString(2);
+                long modified = c.isNull(3) ? 0 : c.getLong(3);
                 if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) {
                     collect(tree, id, out, depth + 1);
                 } else if (isPlayable(name, mime)) {
-                    out.add(new Track(DocumentsContract.buildDocumentUriUsingTree(tree, id).toString(), name, 0));
+                    Track t = new Track(DocumentsContract.buildDocumentUriUsingTree(tree, id).toString(),
+                            name, 0);
+                    t.modifiedAt = modified;
+                    out.add(t);
                 }
             }
         } catch (Exception e) { /* skip this folder */ }
@@ -6397,7 +6708,7 @@ public class NowPlayingActivity extends Activity implements Engine.Listener {
 
     private TextView programName, stepTitle, stepDetail, clock, remain, badge;
     private SeekBar seek;
-    private ImageView play;
+    private ImageView play, shuffle;
     private LinearLayout root;
     private boolean dragging;
     private boolean dimmed;
@@ -6424,7 +6735,11 @@ public class NowPlayingActivity extends Activity implements Engine.Listener {
         root.setBackgroundColor(Ui.BG);
         root.setFitsSystemWindows(true);
 
+        shuffle = Ui.iconBtn(this, Ico.SHUFFLE, Ui.DIM, 20, "Shuffle", new View.OnClickListener() {
+            public void onClick(View v) { Ui.buzz(v); PlayerBar.askShuffle(NowPlayingActivity.this, eng); }
+        });
         View[] actions = {
+            shuffle,
             Ui.iconBtn(this, Ico.MOON, Ui.DIM, 20, "Dim the screen", new View.OnClickListener() {
                 public void onClick(View v) { setDim(!dimmed); }
             })
@@ -6574,6 +6889,7 @@ public class NowPlayingActivity extends Activity implements Engine.Listener {
 
         Ui.setIcon(play, s.paused ? Ico.PLAY : Ico.PAUSE, Ui.ONACC);
         play.setContentDescription(s.paused ? "Resume" : "Pause");
+        if (shuffle != null) Ui.setIcon(shuffle, Ico.SHUFFLE, s.shuffled ? Ui.ACC_TXT : Ui.DIM);
     }
 
     // ---- engine callbacks ------------------------------------------------
