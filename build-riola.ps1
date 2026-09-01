@@ -4261,26 +4261,43 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
 
     /** A short lived "step removed - undo" strip, friendlier than a confirm dialog. */
     private View undoBar() {
+        View.OnClickListener undo = new View.OnClickListener() {
+            public void onClick(View v) {
+                Ui.buzz(v);
+                restoreStep();
+            }
+        };
         LinearLayout r = Ui.row(this);
-        r.setBackground(Ui.rrs(this, Ui.SURF2, Ui.AMBER, 12, 1));
-        r.setPadding(Ui.dp(this, 12), Ui.dp(this, 10), Ui.dp(this, 8), Ui.dp(this, 10));
+        r.setBackground(Ui.ripple(Ui.rrs(this, Ui.SURF2, Ui.AMBER, 12, 1)));
+        r.setPadding(Ui.dp(this, 12), Ui.dp(this, 12), Ui.dp(this, 8), Ui.dp(this, 12));
         Ui.margin(this, r, 0, 0, 0, 8);
+        // the whole strip undoes, not just the button - it is a small target
+        // with a short life, so it should be hard to miss
+        r.setClickable(true);
+        r.setContentDescription("Undo removing the step");
+        r.setOnClickListener(undo);
         TextView t = Ui.tv(this, "Step removed", 13, Ui.TXT, false);
         t.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
         r.addView(t);
-        r.addView(Ui.btn(this, "Undo", Ico.RESET, Ui.SECONDARY, new View.OnClickListener() {
-            public void onClick(View v) {
-                if (undoStep == null) return;
-                int at = Math.max(0, Math.min(undoAt, prog.steps.size()));
-                prog.steps.add(at, undoStep);
-                undoStep = null;
-                undoAt = -1;
-                ui.removeCallbacks(clearUndo);
-                save();
-                refresh();
-            }
-        }));
+        r.addView(Ui.btn(this, "Undo", Ico.RESET, Ui.SECONDARY, undo));
         return r;
+    }
+
+    /** Puts the last deleted step back where it was. */
+    private void restoreStep() {
+        ui.removeCallbacks(clearUndo);
+        Step back = undoStep;
+        int at = undoAt;
+        undoStep = null;
+        undoAt = -1;
+        if (back == null || prog == null) {
+            refresh();          // at least clear the strip rather than sit there dead
+            return;
+        }
+        prog.steps.add(Math.max(0, Math.min(at, prog.steps.size())), back);
+        save();
+        refresh();
+        Ui.toast(this, "Step restored");
     }
 
     private void removeStep(int index) {
