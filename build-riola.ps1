@@ -378,12 +378,24 @@ public class Track {
     public String uri;
     public String title;
     public long durMs;
+    /** Which audio stream to play, for files that carry more than one. -1 = whatever the file defaults to. */
+    public int audioTrack = -1;
 
     public Track(String uri, String title, long durMs) {
         this.uri = uri;
         this.title = title;
         this.durMs = durMs;
     }
+
+    /** Video files are welcome; Riola just never asks for the picture. */
+    public boolean isVideo() {
+        String t = (title == null ? "" : title).toLowerCase();
+        for (int i = 0; i < VIDEO.length; i++) if (t.endsWith(VIDEO[i])) return true;
+        return false;
+    }
+
+    private static final String[] VIDEO = { ".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v",
+            ".3gp", ".ts", ".flv", ".wmv", ".mpg", ".mpeg" };
 
     public Uri toUri() { return Uri.parse(uri); }
 
@@ -404,7 +416,8 @@ public class Track {
     }
 
     private static final String[] EXTS = { ".mp3", ".m4a", ".aac", ".wav", ".ogg", ".oga",
-            ".opus", ".flac", ".mp4", ".mka", ".wma", ".aif", ".aiff", ".mid", ".amr", ".3gp" };
+            ".opus", ".flac", ".mp4", ".mka", ".wma", ".aif", ".aiff", ".mid", ".amr", ".3gp",
+            ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts", ".flv", ".wmv", ".mpg", ".mpeg" };
 }
 '@
 
@@ -720,6 +733,10 @@ public class Prefs {
     public int     autoStopMin()   { return sp.getInt("autostop", 0); }     // 0 = off
     public float   speed()         { return speedPct() / 100f; }
     public boolean seeded()        { return sp.getBoolean("seeded2", false); }
+    public int     accent()        { return sp.getInt("accent", Ui.ACCENTS[0]); }
+    public void    accent(int v)   { sp.edit().putInt("accent", v).apply(); }
+    public int     style()         { return sp.getInt("style", Ui.STYLE_MATERIAL); }
+    public void    style(int v)    { sp.edit().putInt("style", v).apply(); }
     public boolean notifNagged()   { return sp.getBoolean("notifnag", false); }
     public void    notifNagged(boolean v) { sp.edit().putBoolean("notifnag", v).apply(); }
 
@@ -739,7 +756,7 @@ public class Prefs {
     public void resetAll() {
         sp.edit().remove("keepOn").remove("wake").remove("unplug").remove("focus")
           .remove("haptics").remove("fade").remove("vol").remove("speed")
-          .remove("countin").remove("autostop").apply();
+          .remove("countin").remove("autostop").remove("accent").remove("style").apply();
     }
 }
 '@
@@ -792,7 +809,9 @@ public final class Store {
             JSONArray arr = new JSONArray(sp(c).getString("lib", "[]"));
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.getJSONObject(i);
-                LIB.add(new Track(o.getString("u"), o.optString("t", "track"), o.optLong("d", 0)));
+                Track t = new Track(o.getString("u"), o.optString("t", "track"), o.optLong("d", 0));
+                t.audioTrack = o.optInt("a", -1);
+                LIB.add(t);
             }
         } catch (Exception e) { LIB.clear(); }
         try {
@@ -848,6 +867,7 @@ public final class Store {
                 o.put("u", t.uri);
                 o.put("t", t.title);
                 o.put("d", t.durMs);
+                o.put("a", t.audioTrack);
                 arr.put(o);
             } catch (Exception e) { /* skip this one */ }
         }
@@ -959,21 +979,142 @@ public final class Ui {
     public static boolean dark = true;
     public static int BG, SURF, SURF2, LINE, TXT, DIM, ACC, ACC2, RED, GREEN, AMBER, RIPPLE, ONACC, FIELD;
 
+    /** Colours offered in settings. Any other colour can be mixed by hand. */
+    public static final int[] ACCENTS = {
+        0xFF4CC2FF, 0xFF25D0B8, 0xFFFF5FA2, 0xFF9B7CFF,
+        0xFFFFB300, 0xFF7ED957, 0xFFFF7043, 0xFF5C9DFF
+    };
+    public static final String[] ACCENT_NAMES = {
+        "Aqua", "Teal", "Magenta", "Violet",
+        "Amber", "Lime", "Coral", "Sky"
+    };
+
+    public static final int STYLE_MATERIAL = 0, STYLE_ELEGANT = 1, STYLE_RETRO = 2,
+                            STYLE_CODER = 3, STYLE_98 = 4, STYLE_FUTURE = 5;
+    public static final String[] STYLE_NAMES = {
+        "Material", "Elegant", "Retro", "Coder", "98", "Futuristic"
+    };
+    public static final String[] STYLE_NOTES = {
+        "Soft corners and quiet lines. The default.",
+        "Serif type, thin rules, room to breathe.",
+        "Warm paper, heavy borders, chunky type.",
+        "Monospace everything and square corners.",
+        "Grey panels and hard edges, like an old desktop.",
+        "Wide letter spacing and very round shapes."
+    };
+
+    // metrics the look controls
+    public static float RAD_CARD, RAD_BTN, RAD_CHIP, STROKE_W, TRACK_SP, ICON_W, PAD;
+    public static Typeface FONT, FONT_BOLD;
+    public static boolean CAPS_HEADINGS, SQUARE_ICONS;
+    public static int style = STYLE_MATERIAL;
+
     private Ui() { }
 
-    public static void theme(boolean isDark) {
+    public static void theme(Prefs p) {
+        theme(p.dark(), p.accent(), p.style());
+    }
+
+    public static void theme(boolean isDark, int accent, int look) {
         dark = isDark;
+        style = look < 0 || look >= STYLE_NAMES.length ? STYLE_MATERIAL : look;
+
         if (isDark) {
             BG    = 0xFF0E1116; SURF  = 0xFF161C24; SURF2 = 0xFF1E2630; LINE  = 0xFF2C3542;
-            TXT   = 0xFFE8EDF3; DIM   = 0xFF93A1B0; ACC   = 0xFF4CC2FF; ACC2  = 0xFF8B7CFF;
+            TXT   = 0xFFE8EDF3; DIM   = 0xFF93A1B0;
             RED   = 0xFFFF6B6B; GREEN = 0xFF3DDC97; AMBER = 0xFFFFC65C;
-            RIPPLE = 0x33FFFFFF; ONACC = 0xFF06131C; FIELD = 0xFF0B0F14;
+            RIPPLE = 0x33FFFFFF; FIELD = 0xFF0B0F14;
         } else {
             BG    = 0xFFF4F6FA; SURF  = 0xFFFFFFFF; SURF2 = 0xFFEDF1F7; LINE  = 0xFFD6DEE8;
-            TXT   = 0xFF12181F; DIM   = 0xFF5A6673; ACC   = 0xFF0A7FC7; ACC2  = 0xFF5B4BE0;
+            TXT   = 0xFF12181F; DIM   = 0xFF5A6673;
             RED   = 0xFFD03A3A; GREEN = 0xFF10875A; AMBER = 0xFFA97400;
-            RIPPLE = 0x22000000; ONACC = 0xFFFFFFFF; FIELD = 0xFFF8FAFC;
+            RIPPLE = 0x22000000; FIELD = 0xFFF8FAFC;
         }
+
+        ACC = accent == 0 ? ACCENTS[0] : accent;
+        ACC2 = shift(ACC, isDark);
+        ONACC = luminance(ACC) > 0.55f ? 0xFF101418 : 0xFFFFFFFF;
+
+        // defaults, then the look adjusts them
+        RAD_CARD = 18; RAD_BTN = 12; RAD_CHIP = 20; STROKE_W = 1f;
+        TRACK_SP = 0.12f; ICON_W = 1.9f; PAD = 1f;
+        FONT = Typeface.DEFAULT; FONT_BOLD = Typeface.DEFAULT_BOLD;
+        CAPS_HEADINGS = true; SQUARE_ICONS = false;
+
+        switch (style) {
+            case STYLE_ELEGANT:
+                RAD_CARD = 6; RAD_BTN = 4; RAD_CHIP = 14; STROKE_W = 0.8f;
+                TRACK_SP = 0.05f; ICON_W = 1.5f; PAD = 1.15f;
+                FONT = Typeface.SERIF;
+                FONT_BOLD = Typeface.create(Typeface.SERIF, Typeface.BOLD);
+                CAPS_HEADINGS = false;
+                break;
+            case STYLE_RETRO:
+                RAD_CARD = 10; RAD_BTN = 8; RAD_CHIP = 12; STROKE_W = 2.2f;
+                TRACK_SP = 0.08f; ICON_W = 2.4f; PAD = 1.05f;
+                FONT = Typeface.SERIF;
+                FONT_BOLD = Typeface.create(Typeface.SERIF, Typeface.BOLD);
+                if (isDark) {
+                    BG = 0xFF17120E; SURF = 0xFF231A13; SURF2 = 0xFF2E231A; LINE = 0xFF4A3928;
+                    TXT = 0xFFF3E7D6; DIM = 0xFFB9A487; FIELD = 0xFF120E0A;
+                } else {
+                    BG = 0xFFF6EFE2; SURF = 0xFFFFF9EE; SURF2 = 0xFFEFE4D2; LINE = 0xFFCBB694;
+                    TXT = 0xFF2C2114; DIM = 0xFF7A6650; FIELD = 0xFFFFFBF3;
+                }
+                break;
+            case STYLE_CODER:
+                RAD_CARD = 2; RAD_BTN = 2; RAD_CHIP = 2; STROKE_W = 1.4f;
+                TRACK_SP = 0.02f; ICON_W = 2f; PAD = 0.95f;
+                FONT = Typeface.MONOSPACE;
+                FONT_BOLD = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD);
+                CAPS_HEADINGS = false; SQUARE_ICONS = true;
+                if (isDark) {
+                    BG = 0xFF07090B; SURF = 0xFF0D1116; SURF2 = 0xFF141A21; LINE = 0xFF243040;
+                    TXT = 0xFFD7E4D7; DIM = 0xFF7C8C7C; FIELD = 0xFF05070A;
+                } else {
+                    BG = 0xFFF7F8F5; SURF = 0xFFFFFFFF; SURF2 = 0xFFEDF0EA; LINE = 0xFFC9D2C4;
+                    TXT = 0xFF13201A; DIM = 0xFF5A6B5F; FIELD = 0xFFFBFCFA;
+                }
+                break;
+            case STYLE_98:
+                RAD_CARD = 0; RAD_BTN = 0; RAD_CHIP = 0; STROKE_W = 2.4f;
+                TRACK_SP = 0f; ICON_W = 2.2f; PAD = 0.9f;
+                CAPS_HEADINGS = false; SQUARE_ICONS = true;
+                if (isDark) {
+                    BG = 0xFF2B2B2B; SURF = 0xFF3C3C3C; SURF2 = 0xFF4A4A4A; LINE = 0xFF7A7A7A;
+                    TXT = 0xFFF0F0F0; DIM = 0xFFB4B4B4; FIELD = 0xFF262626;
+                } else {
+                    BG = 0xFFBFBFBF; SURF = 0xFFD8D8D8; SURF2 = 0xFFCCCCCC; LINE = 0xFF6E6E6E;
+                    TXT = 0xFF101010; DIM = 0xFF4A4A4A; FIELD = 0xFFFFFFFF;
+                }
+                break;
+            case STYLE_FUTURE:
+                RAD_CARD = 26; RAD_BTN = 22; RAD_CHIP = 24; STROKE_W = 1f;
+                TRACK_SP = 0.22f; ICON_W = 1.4f; PAD = 1.1f;
+                if (isDark) {
+                    BG = 0xFF080B14; SURF = 0xFF101528; SURF2 = 0xFF171E36; LINE = 0xFF2A3358;
+                    TXT = 0xFFEDF1FF; DIM = 0xFF8E9AC6; FIELD = 0xFF070A12;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    /** A companion colour for the accent, used for small marks. */
+    private static int shift(int c, boolean isDark) {
+        float[] hsv = new float[3];
+        android.graphics.Color.colorToHSV(c, hsv);
+        hsv[0] = (hsv[0] + 38f) % 360f;
+        hsv[1] = Math.min(1f, hsv[1] * 0.95f);
+        hsv[2] = isDark ? Math.min(1f, hsv[2] * 1.05f) : hsv[2] * 0.9f;
+        return android.graphics.Color.HSVToColor(hsv);
+    }
+
+    /** Rough perceived brightness, for deciding what reads on top of the accent. */
+    public static float luminance(int c) {
+        int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+        return (0.299f * r + 0.587f * g + 0.114f * b) / 255f;
     }
 
     public static int dp(Context c, float v) {
@@ -1061,9 +1202,9 @@ public final class Ui {
 
     public static LinearLayout card(Context c) {
         LinearLayout l = col(c);
-        l.setBackground(rrs(c, SURF, LINE, 18, 1));
-        int p = dp(c, 14);
-        l.setPadding(p, dp(c, 12), p, dp(c, 12));
+        l.setBackground(rrs(c, SURF, LINE, RAD_CARD, STROKE_W));
+        int p = dp(c, 14 * PAD);
+        l.setPadding(p, dp(c, 12 * PAD), p, dp(c, 12 * PAD));
         margin(c, l, 12, 0, 12, 10);
         return l;
     }
@@ -1110,7 +1251,7 @@ public final class Ui {
         t.setText(s);
         t.setTextSize(sp);
         t.setTextColor(color);
-        if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setTypeface(bold ? FONT_BOLD : FONT);
         t.setLayoutParams(lp(WRAP, WRAP));
         return t;
     }
@@ -1127,8 +1268,8 @@ public final class Ui {
             r.addView(icon(c, icoId, ACC, 16));
             r.addView(hgap(c, 8));
         }
-        TextView t = tv(c, text.toUpperCase(), 12, DIM, true);
-        t.setLetterSpacing(0.12f);
+        TextView t = tv(c, CAPS_HEADINGS ? text.toUpperCase() : text, 12, DIM, true);
+        t.setLetterSpacing(TRACK_SP);
         r.addView(t);
         margin(c, r, 0, 0, 0, 8);
         return r;
@@ -1205,8 +1346,8 @@ public final class Ui {
         LinearLayout b = new LinearLayout(c);
         b.setOrientation(LinearLayout.HORIZONTAL);
         b.setGravity(Gravity.CENTER);
-        b.setPadding(dp(c, 14), dp(c, 11), dp(c, 14), dp(c, 11));
-        b.setBackground(ripple(rrs(c, fill, stroke, 12, 1)));
+        b.setPadding(dp(c, 14 * PAD), dp(c, 11 * PAD), dp(c, 14 * PAD), dp(c, 11 * PAD));
+        b.setBackground(ripple(rrs(c, fill, stroke, RAD_BTN, STROKE_W)));
         b.setClickable(true);
         b.setOnClickListener(l);
         b.setLayoutParams(lp(WRAP, WRAP));
@@ -1227,7 +1368,7 @@ public final class Ui {
     public static TextView chip(Context c, String text, boolean on, View.OnClickListener l) {
         TextView t = tv(c, text, 12, on ? ONACC : DIM, true);
         t.setPadding(dp(c, 13), dp(c, 8), dp(c, 13), dp(c, 8));
-        t.setBackground(ripple(rrs(c, on ? ACC : SURF2, on ? ACC : LINE, 20, 1)));
+        t.setBackground(ripple(rrs(c, on ? ACC : SURF2, on ? ACC : LINE, RAD_CHIP, STROKE_W)));
         t.setOnClickListener(l);
         t.setSingleLine(true);
         LinearLayout.LayoutParams p = lp(WRAP, WRAP);
@@ -1389,7 +1530,7 @@ public final class Ui {
     /** Two or three mutually exclusive options. */
     public static LinearLayout seg(final Context c, final String[] labels, final int selected, final OnPick cb) {
         final LinearLayout r = row(c);
-        r.setBackground(rr(c, SURF2, 12));
+        r.setBackground(rr(c, SURF2, RAD_BTN));
         int pad = dp(c, 3);
         r.setPadding(pad, pad, pad, pad);
         for (int i = 0; i < labels.length; i++) {
@@ -1398,8 +1539,8 @@ public final class Ui {
             t.setGravity(Gravity.CENTER);
             t.setPadding(dp(c, 10), dp(c, 9), dp(c, 10), dp(c, 9));
             t.setLayoutParams(lpw(0, WRAP, 1f));
-            if (i == selected) t.setBackground(rr(c, ACC, 10));
-            else t.setBackground(ripple(rr(c, 0x00000000, 10)));
+            if (i == selected) t.setBackground(rr(c, ACC, Math.max(2f, RAD_BTN - 2f)));
+            else t.setBackground(ripple(rr(c, 0x00000000, Math.max(2f, RAD_BTN - 2f))));
             t.setOnClickListener(new View.OnClickListener() {
                 public void onClick(View v) { buzz(v); cb.set(index); }
             });
@@ -1446,7 +1587,7 @@ public final class Ui {
     /** A tappable "label / value >" row used for pickers. */
     public static LinearLayout field(Context c, String label, String value, int icoId, View.OnClickListener l) {
         LinearLayout r = row(c);
-        r.setBackground(ripple(rrs(c, FIELD, LINE, 12, 1)));
+        r.setBackground(ripple(rrs(c, FIELD, LINE, RAD_BTN, STROKE_W)));
         r.setPadding(dp(c, 12), dp(c, 11), dp(c, 10), dp(c, 11));
         margin(c, r, 0, 6, 0, 0);
         r.setOnClickListener(l);
@@ -1513,9 +1654,9 @@ public class Ico extends Drawable {
         float oy = b.exactCenterY() - 12f * u;
 
         p.setColor(color);
-        p.setStrokeWidth(1.9f * u);
-        p.setStrokeCap(Paint.Cap.ROUND);
-        p.setStrokeJoin(Paint.Join.ROUND);
+        p.setStrokeWidth(Ui.ICON_W * u);
+        p.setStrokeCap(Ui.SQUARE_ICONS ? Paint.Cap.BUTT : Paint.Cap.ROUND);
+        p.setStrokeJoin(Ui.SQUARE_ICONS ? Paint.Join.MITER : Paint.Join.ROUND);
         p.setStyle(Paint.Style.STROKE);
         p.setTextAlign(Paint.Align.CENTER);
 
@@ -1758,6 +1899,203 @@ public class Ico extends Drawable {
 '@
 
 # ---------------------------------------------------------------------------
+# Java: choosing the colour and the look
+# ---------------------------------------------------------------------------
+Write-Src "$PKG_PATH\Themes.java" @'
+package com.riola.player;
+
+import android.app.Activity;
+import android.content.DialogInterface;
+import android.content.res.ColorStateList;
+import android.graphics.drawable.GradientDrawable;
+import android.view.Gravity;
+import android.view.View;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.SeekBar;
+import android.widget.TextView;
+
+/** The two dialogs behind "Colour" and "Look" in settings. */
+public final class Themes {
+
+    public interface OnChosen { void chosen(); }
+
+    private Themes() { }
+
+    // ---- colour ----------------------------------------------------------
+    public static void colour(final Activity a, final Prefs prefs, final OnChosen cb) {
+        final int current = prefs.accent();
+
+        LinearLayout box = Ui.col(a);
+        int p = Ui.dp(a, 18);
+        box.setPadding(p, Ui.dp(a, 8), p, 0);
+
+        final android.app.AlertDialog[] holder = new android.app.AlertDialog[1];
+
+        LinearLayout row = Ui.row(a);
+        for (int i = 0; i < Ui.ACCENTS.length; i++) {
+            final int colour = Ui.ACCENTS[i];
+            if (i == 4) {                       // second row of swatches
+                box.addView(row);
+                row = Ui.row(a);
+                Ui.margin(a, row, 0, 8, 0, 0);
+            }
+            View sw = swatch(a, colour, colour == current);
+            sw.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    Ui.buzz(v);
+                    prefs.accent(colour);
+                    if (holder[0] != null) holder[0].dismiss();
+                    cb.chosen();
+                }
+            });
+            row.addView(sw);
+        }
+        box.addView(row);
+
+        TextView note = Ui.tv(a, "The colour is used for buttons, highlights and the playing step.",
+                11.5f, Ui.DIM, false);
+        Ui.margin(a, note, 2, 12, 0, 0);
+        box.addView(note);
+        box.addView(Ui.gap(a, 6));
+
+        holder[0] = Ui.dialog(a).setTitle("Colour").setView(box)
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("Mix your own", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) { custom(a, prefs, cb); }
+                }).create();
+        holder[0].show();
+    }
+
+    private static View swatch(Activity a, int colour, boolean selected) {
+        GradientDrawable g = new GradientDrawable();
+        g.setShape(GradientDrawable.OVAL);
+        g.setColor(colour);
+        if (selected) g.setStroke(Ui.dp(a, 3), Ui.TXT);
+        View v = new View(a);
+        v.setBackground(g);
+        LinearLayout.LayoutParams lp = Ui.lp(Ui.dp(a, 52), Ui.dp(a, 52));
+        lp.setMargins(Ui.dp(a, 6), 0, Ui.dp(a, 6), 0);
+        v.setLayoutParams(lp);
+        v.setContentDescription(selected ? "colour, selected" : "colour");
+        return v;
+    }
+
+    /** Three sliders and a live preview - enough, and no library needed. */
+    private static void custom(final Activity a, final Prefs prefs, final OnChosen cb) {
+        final int start = prefs.accent();
+        final int[] rgb = { (start >> 16) & 0xFF, (start >> 8) & 0xFF, start & 0xFF };
+
+        LinearLayout box = Ui.col(a);
+        int p = Ui.dp(a, 18);
+        box.setPadding(p, Ui.dp(a, 10), p, 0);
+
+        final View preview = new View(a);
+        preview.setLayoutParams(Ui.lp(Ui.MATCH, Ui.dp(a, 64)));
+        box.addView(preview);
+
+        final TextView hex = Ui.mono(a, "", 13, Ui.DIM);
+        hex.setGravity(Gravity.CENTER);
+        hex.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
+        Ui.margin(a, hex, 0, 8, 0, 4);
+        box.addView(hex);
+
+        final Runnable paint = new Runnable() {
+            public void run() {
+                int c = 0xFF000000 | (rgb[0] << 16) | (rgb[1] << 8) | rgb[2];
+                GradientDrawable g = new GradientDrawable();
+                g.setColor(c);
+                g.setCornerRadius(Ui.dp(a, Ui.RAD_BTN));
+                g.setStroke(Math.max(1, Ui.dp(a, 1)), Ui.LINE);
+                preview.setBackground(g);
+                hex.setText(String.format("#%02X%02X%02X", rgb[0], rgb[1], rgb[2]));
+            }
+        };
+        paint.run();
+
+        String[] names = { "Red", "Green", "Blue" };
+        for (int i = 0; i < 3; i++) {
+            final int channel = i;
+            LinearLayout r = Ui.row(a);
+            Ui.margin(a, r, 0, 4, 0, 0);
+            TextView label = Ui.tv(a, names[i], 13, Ui.DIM, false);
+            label.setWidth(Ui.dp(a, 56));
+            r.addView(label);
+            SeekBar s = new SeekBar(a);
+            s.setMax(255);
+            s.setProgress(rgb[i]);
+            s.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+            s.setProgressTintList(ColorStateList.valueOf(Ui.ACC));
+            s.setThumbTintList(ColorStateList.valueOf(Ui.ACC));
+            s.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                public void onProgressChanged(SeekBar b, int v, boolean fromUser) {
+                    rgb[channel] = v;
+                    paint.run();
+                }
+                public void onStartTrackingTouch(SeekBar b) { }
+                public void onStopTrackingTouch(SeekBar b) { }
+            });
+            r.addView(s);
+            box.addView(r);
+        }
+        box.addView(Ui.gap(a, 8));
+
+        Ui.dialog(a).setTitle("Mix a colour").setView(box)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Use it", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) {
+                        prefs.accent(0xFF000000 | (rgb[0] << 16) | (rgb[1] << 8) | rgb[2]);
+                        cb.chosen();
+                    }
+                }).show();
+    }
+
+    // ---- look ------------------------------------------------------------
+    public static void look(final Activity a, final Prefs prefs, final OnChosen cb) {
+        final int current = prefs.style();
+
+        LinearLayout box = Ui.col(a);
+        int p = Ui.dp(a, 12);
+        box.setPadding(p, p, p, 0);
+
+        final android.app.AlertDialog[] holder = new android.app.AlertDialog[1];
+
+        for (int i = 0; i < Ui.STYLE_NAMES.length; i++) {
+            final int which = i;
+            LinearLayout r = Ui.row(a);
+            r.setPadding(Ui.dp(a, 12), Ui.dp(a, 11), Ui.dp(a, 12), Ui.dp(a, 11));
+            r.setBackground(Ui.ripple(i == current
+                    ? Ui.rrs(a, Ui.SURF2, Ui.ACC, Ui.RAD_BTN, 1.4f)
+                    : Ui.rr(a, Ui.SURF2, Ui.RAD_BTN)));
+            Ui.margin(a, r, 0, 0, 0, 6);
+            LinearLayout col = Ui.col(a);
+            col.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+            col.addView(Ui.tv(a, Ui.STYLE_NAMES[i], 15, Ui.TXT, true));
+            col.addView(Ui.tv(a, Ui.STYLE_NOTES[i], 11.5f, Ui.DIM, false));
+            r.addView(col);
+            if (i == current) r.addView(Ui.icon(a, Ico.CHECK, Ui.ACC, 18));
+            r.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    Ui.buzz(v);
+                    prefs.style(which);
+                    if (holder[0] != null) holder[0].dismiss();
+                    cb.chosen();
+                }
+            });
+            box.addView(r);
+        }
+
+        ScrollView sv = new ScrollView(a);
+        sv.addView(box, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
+        holder[0] = Ui.dialog(a).setTitle("Look").setView(sv)
+                .setNegativeButton("Cancel", null).create();
+        holder[0].show();
+    }
+}
+'@
+
+# ---------------------------------------------------------------------------
 # Java: the synthesised bell
 # ---------------------------------------------------------------------------
 Write-Src "$PKG_PATH\Bell.java" @'
@@ -1781,9 +2119,9 @@ public class Bell {
 
     public static final int LOW = 0, WARM = 1, BRIGHT = 2, DESK = 3;
 
-    private static final int RATE = 22050;
-    private static final float[] F0    = { 174.6f, 261.6f, 392.0f, 1046.5f };  // F3, C4, G4, C6
-    private static final long[]  LEN   = { 6000, 5000, 4000, 1500 };
+    private static final int RATE = 44100;
+    private static final float[] F0    = { 174.6f, 261.6f, 392.0f, 1480.0f };  // F3, C4, G4, F#6
+    private static final long[]  LEN   = { 6000, 5000, 4000, 900 };
     private static final String[] NAMES = { "low", "warm", "bright", "desk" };
 
     private static final short[][] CACHE = new short[4][];
@@ -1819,10 +2157,10 @@ public class Bell {
             // about a second. Short decays are what make it read as a "ting"
             // rather than a chime.
             ratio = new float[]{ 1.00f, 2.71f, 5.18f, 8.16f, 9.42f };
-            amp   = new float[]{ 1.00f, 0.55f, 0.30f, 0.15f, 0.07f };
-            decay = new float[]{ 0.95f, 0.58f, 0.34f, 0.20f, 0.12f };
-            attack = 0.002f;
-            tail = 0.12f;
+            amp   = new float[]{ 1.00f, 0.58f, 0.32f, 0.16f, 0.08f };
+            decay = new float[]{ 0.42f, 0.26f, 0.16f, 0.10f, 0.06f };
+            attack = 0.0015f;
+            tail = 0.08f;
             scale = 9000f;
             shimmer = 0f;
         } else {
@@ -2552,6 +2890,14 @@ public class Engine {
             m.setWakeMode(ctx, PowerManager.PARTIAL_WAKE_LOCK);
             m.setDataSource(ctx, t.toUri());
             m.prepare();
+            // No Surface is ever attached, so a video file simply plays its
+            // sound. Where there is more than one audio stream - a dubbed film,
+            // say - use the one chosen for this track.
+            if (t.audioTrack >= 0) {
+                try { m.selectTrack(t.audioTrack); } catch (Exception e) {
+                    log("  ! could not switch to audio stream " + t.audioTrack);
+                }
+            }
             mp = m;
             loadedUri = t.uri;
             applyVol();
@@ -3891,7 +4237,7 @@ public class MainActivity extends Activity implements PlayerBar.Host {
     @Override
     protected void onCreate(Bundle saved) {
         prefs = new Prefs(this);
-        Ui.theme(prefs.dark());
+        Ui.theme(prefs);
         setTheme(Ui.themeRes(prefs.dark()));
         super.onCreate(saved);
         Store.load(this);
@@ -4309,6 +4655,13 @@ public class MainActivity extends Activity implements PlayerBar.Host {
         Ui.dialog(this).setTitle("How Riola works").setView(sv).setPositiveButton("Close", null).show();
     }
 
+    private String colourName(int c) {
+        for (int i = 0; i < Ui.ACCENTS.length; i++) {
+            if (Ui.ACCENTS[i] == c) return Ui.ACCENT_NAMES[i];
+        }
+        return String.format("Custom  #%06X", c & 0xFFFFFF);
+    }
+
     private void settings() {
         final android.app.AlertDialog[] holder = new android.app.AlertDialog[1];
 
@@ -4324,6 +4677,28 @@ public class MainActivity extends Activity implements PlayerBar.Host {
                 if (holder[0] != null) holder[0].dismiss();
                 reopenSettings = true;
                 recreate();
+            }
+        }));
+
+        final Themes.OnChosen restyle = new Themes.OnChosen() {
+            public void chosen() {
+                if (holder[0] != null) holder[0].dismiss();
+                reopenSettings = true;
+                recreate();
+            }
+        };
+        box.addView(Ui.field(this, "Colour", colourName(prefs.accent()), Ico.WAVE,
+                new View.OnClickListener() {
+            public void onClick(View v) {
+                if (holder[0] != null) holder[0].dismiss();
+                Themes.colour(MainActivity.this, prefs, restyle);
+            }
+        }));
+        box.addView(Ui.field(this, "Look", Ui.STYLE_NAMES[Math.max(0, Math.min(prefs.style(),
+                Ui.STYLE_NAMES.length - 1))], Ico.EDIT, new View.OnClickListener() {
+            public void onClick(View v) {
+                if (holder[0] != null) holder[0].dismiss();
+                Themes.look(MainActivity.this, prefs, restyle);
             }
         }));
         box.addView(Ui.switchRow(this, "Keep the screen on", "while the app is open",
@@ -4452,7 +4827,7 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
     @Override
     protected void onCreate(Bundle saved) {
         prefs = new Prefs(this);
-        Ui.theme(prefs.dark());
+        Ui.theme(prefs);
         setTheme(Ui.themeRes(prefs.dark()));
         super.onCreate(saved);
         Store.load(this);
@@ -5230,7 +5605,7 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
     @Override
     protected void onCreate(Bundle saved) {
         prefs = new Prefs(this);
-        Ui.theme(prefs.dark());
+        Ui.theme(prefs);
         setTheme(Ui.themeRes(prefs.dark()));
         super.onCreate(saved);
         Store.load(this);
@@ -5268,7 +5643,8 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
         folder.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
         btns.addView(folder);
         addCard.addView(btns);
-        TextView hint = Ui.tv(this, "Riola only reads your files. Nothing is copied, moved or changed.",
+        TextView hint = Ui.tv(this, "Riola only reads your files - nothing is copied, moved or "
+                + "changed. Video files work too: only their sound is played.",
                 11.5f, Ui.DIM, false);
         Ui.margin(this, hint, 2, 8, 0, 0);
         addCard.addView(hint);
@@ -5331,7 +5707,8 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
         TextView title = Ui.tv(this, t.shortTitle(), 14, Ui.TXT, false);
         Ui.ellipsize(title);
         col.addView(title);
-        col.addView(Ui.tv(this, (t.durMs > 0 ? Fmt.ms(t.durMs) : "length unknown") + usage(t),
+        col.addView(Ui.tv(this, (t.durMs > 0 ? Fmt.ms(t.durMs) : "length unknown")
+                + (t.isVideo() ? "  .  video, audio only" : "") + usage(t),
                 11, Ui.DIM, false));
         r.addView(col);
 
@@ -5357,7 +5734,8 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
     private void menu(final int index) {
         if (index < 0 || index >= Store.LIB.size()) return;
         final Track t = Store.LIB.get(index);
-        final String[] items = { "Preview", "Rename", "Move up", "Move down", "Remove from library" };
+        final String[] items = { "Preview", "Rename", "Choose audio stream",
+                                 "Move up", "Move down", "Remove from library" };
         Ui.dialog(this).setTitle(t.shortTitle()).setItems(items, new DialogInterface.OnClickListener() {
             public void onClick(DialogInterface d, int which) {
                 switch (which) {
@@ -5376,10 +5754,70 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
                             }
                         });
                         break;
-                    case 2: move(index, -1); break;
-                    case 3: move(index, 1); break;
+                    case 2: chooseAudioStream(t); break;
+                    case 3: move(index, -1); break;
+                    case 4: move(index, 1); break;
                     default: remove(index, t);
                 }
+            }
+        }).show();
+    }
+
+    /**
+     * Films and some recordings carry several audio streams. Reading them means
+     * preparing the file, so it happens off the main thread.
+     */
+    private void chooseAudioStream(final Track t) {
+        Ui.toast(this, "Reading " + t.shortTitle() + "...");
+        new Thread(new Runnable() {
+            public void run() {
+                final java.util.List<String> labels = new ArrayList<String>();
+                final java.util.List<Integer> indexes = new ArrayList<Integer>();
+                android.media.MediaPlayer m = new android.media.MediaPlayer();
+                try {
+                    m.setDataSource(LibraryActivity.this, t.toUri());
+                    m.prepare();
+                    android.media.MediaPlayer.TrackInfo[] info = m.getTrackInfo();
+                    for (int i = 0; i < info.length; i++) {
+                        if (info[i].getTrackType() != android.media.MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_AUDIO) {
+                            continue;
+                        }
+                        String lang = info[i].getLanguage();
+                        if (lang == null || lang.length() == 0 || lang.equals("und")) lang = "unnamed";
+                        labels.add("Stream " + (indexes.size() + 1) + "  (" + lang + ")");
+                        indexes.add(Integer.valueOf(i));
+                    }
+                } catch (Exception e) {
+                    labels.clear();
+                } finally {
+                    try { m.release(); } catch (Exception e) { /* ignore */ }
+                }
+                runOnUiThread(new Runnable() {
+                    public void run() { showStreams(t, labels, indexes); }
+                });
+            }
+        }, "riola-streams").start();
+    }
+
+    private void showStreams(final Track t, java.util.List<String> labels,
+                             final java.util.List<Integer> indexes) {
+        if (labels.isEmpty()) {
+            Ui.dialog(this).setTitle("No choice to make")
+                    .setMessage("Riola could not read the audio streams in this file, or there is "
+                            + "only one. It will play whichever the file provides.")
+                    .setPositiveButton("OK", null).show();
+            return;
+        }
+        final String[] items = new String[labels.size() + 1];
+        items[0] = "Whatever the file defaults to";
+        for (int i = 0; i < labels.size(); i++) items[i + 1] = labels.get(i);
+        Ui.dialog(this).setTitle(t.shortTitle()).setItems(items, new DialogInterface.OnClickListener() {
+            public void onClick(DialogInterface d, int which) {
+                t.audioTrack = which == 0 ? -1 : indexes.get(which - 1).intValue();
+                Store.saveLib(LibraryActivity.this);
+                Ui.toast(LibraryActivity.this, which == 0 ? "Using the file's own choice"
+                                                          : ("Using " + items[which]));
+                refresh();
             }
         }).show();
     }
@@ -5431,9 +5869,10 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
     private void pickFiles() {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
-        i.setType("audio/*");
+        i.setType("*/*");
         i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
-        i.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{ "audio/*", "application/ogg", "application/x-ogg" });
+        i.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{ "audio/*", "video/*",
+                "application/ogg", "application/x-ogg" });
         i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         try { startActivityForResult(i, REQ_FILES); }
         catch (Exception e) { Ui.toast(this, "No file picker on this device"); }
@@ -5538,7 +5977,7 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
                 String id = c.getString(0), name = c.getString(1), mime = c.getString(2);
                 if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) {
                     collect(tree, id, out, depth + 1);
-                } else if (isAudio(name, mime)) {
+                } else if (isPlayable(name, mime)) {
                     out.add(new Track(DocumentsContract.buildDocumentUriUsingTree(tree, id).toString(), name, 0));
                 }
             }
@@ -5546,12 +5985,17 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
         finally { if (c != null) c.close(); }
     }
 
-    private boolean isAudio(String name, String mime) {
-        if (mime != null && mime.startsWith("audio/")) return true;
+    /** Anything Riola can pull sound out of, video included. */
+    private boolean isPlayable(String name, String mime) {
+        if (mime != null && (mime.startsWith("audio/") || mime.startsWith("video/"))) return true;
         if (name == null) return false;
         String n = name.toLowerCase();
-        return n.endsWith(".mp3") || n.endsWith(".m4a") || n.endsWith(".aac") || n.endsWith(".wav")
-                || n.endsWith(".ogg") || n.endsWith(".opus") || n.endsWith(".flac") || n.endsWith(".mp4");
+        String[] ok = { ".mp3", ".m4a", ".aac", ".wav", ".ogg", ".oga", ".opus", ".flac", ".mka",
+                        ".wma", ".aif", ".aiff", ".amr",
+                        ".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".3gp", ".ts", ".flv",
+                        ".wmv", ".mpg", ".mpeg" };
+        for (int i = 0; i < ok.length; i++) if (n.endsWith(ok[i])) return true;
+        return false;
     }
 
     private void readDurations() {
@@ -5880,7 +6324,7 @@ public class NowPlayingActivity extends Activity implements Engine.Listener {
     @Override
     protected void onCreate(Bundle saved) {
         prefs = new Prefs(this);
-        Ui.theme(prefs.dark());
+        Ui.theme(prefs);
         setTheme(Ui.themeRes(prefs.dark()));
         super.onCreate(saved);
         eng = Engine.get(this);
