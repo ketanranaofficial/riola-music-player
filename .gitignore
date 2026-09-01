@@ -12,3 +12,8 @@ riola/
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Signing keys must never be committed
+*.jks
+*.keystore
+key.properties

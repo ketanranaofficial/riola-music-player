@@ -27,7 +27,21 @@ param(
     [string] $ApkName     = 'riola.apk',
     [switch] $SourcesOnly,
     [switch] $Install,
-    [switch] $Clean
+    [switch] $Clean,
+
+    # Release signing. Without these the apk is signed with the debug key,
+    # which is fine for your own phone and useless for a store.
+    [switch] $Release,
+    [string] $Keystore    = '',
+    [string] $KeyAlias    = '',
+    [string] $StorePass   = '',
+    [string] $KeyPass     = '',
+
+    # Play requires new apps to target a recent api. Leave this at 0 and the
+    # build targets the newest platform installed in the sdk.
+    [int]    $TargetSdk   = 0,
+    [int]    $VersionCode = 4,
+    [string] $VersionName = '1.0'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -64,8 +78,20 @@ if (-not $env:ANDROID_HOME -and $env:ANDROID_SDK_ROOT) { $env:ANDROID_HOME = $en
 if (-not $env:ANDROID_HOME) { $env:ANDROID_HOME = Join-Path $env:LOCALAPPDATA 'Android\Sdk' }
 if (-not (Test-Path $env:ANDROID_HOME)) { Die "Android SDK not found. Set ANDROID_HOME." }
 
-$AndroidJar = Join-Path $env:ANDROID_HOME 'platforms\android-34\android.jar'
-if (-not (Test-Path $AndroidJar)) { Die "Missing $AndroidJar  (install platform android-34)" }
+# Compile against the newest platform present, unless told otherwise.
+$platforms = Get-ChildItem -Path (Join-Path $env:ANDROID_HOME 'platforms') -Directory -ErrorAction SilentlyContinue |
+             Where-Object { $_.Name -match '^android-(\d+)$' } |
+             Sort-Object { [int]($_.Name -replace 'android-', '') }
+if (-not $platforms) { Die "No android platform found under $env:ANDROID_HOME\platforms" }
+$newest = [int](($platforms | Select-Object -Last 1).Name -replace 'android-', '')
+if ($TargetSdk -le 0) { $TargetSdk = $newest }
+if ($TargetSdk -gt $newest) {
+    Warn "Asked to target android-$TargetSdk but the newest installed is android-$newest."
+    Warn "Install it with:  sdkmanager `"platforms;android-$TargetSdk`""
+    Die  "Missing platform android-$TargetSdk"
+}
+$AndroidJar = Join-Path $env:ANDROID_HOME "platforms\android-$TargetSdk\android.jar"
+if (-not (Test-Path $AndroidJar)) { Die "Missing $AndroidJar" }
 
 $btRoot = Join-Path $env:ANDROID_HOME 'build-tools'
 $bt = Get-ChildItem -Path $btRoot -Directory -ErrorAction SilentlyContinue |
@@ -74,8 +100,22 @@ if (-not $bt) { Die "No build-tools found under $btRoot" }
 $btPath = $bt.FullName
 if ($env:PATH -notlike "*$btPath*") { $env:PATH = "$btPath;$env:PATH" }
 
-$Keystore = Join-Path $env:USERPROFILE '.android\debug.keystore'
-if (-not (Test-Path $Keystore)) {
+if ($Release) {
+    if (-not $Keystore -or -not (Test-Path $Keystore)) {
+        Die "-Release needs -Keystore pointing at your upload key. See RELEASING.md."
+    }
+    if (-not $KeyAlias)  { Die "-Release needs -KeyAlias." }
+    if (-not $StorePass) { $StorePass = $env:RIOLA_STOREPASS }
+    if (-not $KeyPass)   { $KeyPass   = if ($env:RIOLA_KEYPASS) { $env:RIOLA_KEYPASS } else { $StorePass } }
+    if (-not $StorePass) { Die "-Release needs -StorePass, or the RIOLA_STOREPASS environment variable." }
+} else {
+    $Keystore  = Join-Path $env:USERPROFILE '.android\debug.keystore'
+    $KeyAlias  = 'androiddebugkey'
+    $StorePass = 'android'
+    $KeyPass   = 'android'
+}
+
+if (-not $Release -and -not (Test-Path $Keystore)) {
     Warn "No debug keystore - creating one..."
     New-Item -ItemType Directory -Force -Path (Split-Path $Keystore -Parent) | Out-Null
     keytool -genkeypair -v -keystore $Keystore -storepass android -keypass android `
@@ -86,7 +126,9 @@ if (-not (Test-Path $Keystore)) {
 
 Write-Host ("  SDK          : " + $env:ANDROID_HOME)
 Write-Host ("  build-tools  : " + $bt.Name)
-Write-Host ("  platform jar : android-34")
+Write-Host ("  platform jar : android-" + $TargetSdk)
+Write-Host ("  version      : " + $VersionName + " (" + $VersionCode + ")")
+Write-Host ("  signing      : " + $(if ($Release) { "release key $KeyAlias" } else { "debug key" }))
 Write-Host ("  out dir      : " + $OutDir)
 
 # ---------------------------------------------------------------------------
@@ -114,14 +156,14 @@ Say "`n[1/3] writing sources"
 # ---------------------------------------------------------------------------
 # AndroidManifest.xml
 # ---------------------------------------------------------------------------
-Write-Src 'AndroidManifest.xml' @'
+Write-Src 'AndroidManifest.xml' @"
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.riola.player"
-    android:versionCode="3"
-    android:versionName="3.0">
+    android:versionCode="$VersionCode"
+    android:versionName="$VersionName">
 
-    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="$TargetSdk" />
 
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -174,7 +216,7 @@ Write-Src 'AndroidManifest.xml' @'
             android:foregroundServiceType="mediaPlayback" />
     </application>
 </manifest>
-'@
+"@
 
 # ---------------------------------------------------------------------------
 # Resources (app name, launcher icon, notification icons)
@@ -6557,8 +6599,8 @@ try {
     zipalign.exe -f 4 unaligned.apk $ApkName
     Assert-Exit 'zipalign'
 
-    apksigner.bat sign --ks $Keystore --ks-pass pass:android --ks-key-alias androiddebugkey `
-                       --key-pass pass:android --min-sdk-version 26 $ApkName
+    apksigner.bat sign --ks $Keystore --ks-pass "pass:$StorePass" --ks-key-alias $KeyAlias `
+                       --key-pass "pass:$KeyPass" --min-sdk-version 26 $ApkName
     Assert-Exit 'apksigner sign'
 
     apksigner.bat verify --min-sdk-version 26 $ApkName
