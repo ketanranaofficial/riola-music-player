@@ -12,6 +12,11 @@ the whole thing twice" is easier to set up once than to babysit.
 There is no scripting language and nothing to type. Every part of a program is
 a tap.
 
+| | | |
+|---|---|---|
+| ![Home](docs/01-home.png) | ![Editor](docs/02-editor.png) | ![Looks](docs/03-looks.png) |
+
+
 ## The whole app is one script
 
 `build-riola.ps1` writes every source file and compiles a signed APK with the
@@ -69,6 +74,17 @@ while you fine-tune it.
 - **Library** — add files or scan a whole folder. Storage Access Framework, so
   no storage permission, and the grants survive reboots. Durations are read in
   the background; tracks can be renamed, reordered and previewed.
+- **Video files work too** — Riola plays their sound and never asks for the
+  picture. Where a file carries several audio streams, a dubbed film say, you
+  can pick which one that track uses.
+- **Colour and Look** — the palette is derived from one accent colour: eight
+  presets or mix your own. Six looks change shape rather than just shade —
+  Material, Elegant, Retro, Coder, 98 and Futuristic each drive corner radius,
+  border weight, typeface, spacing and icon line weight. Both are independent
+  of dark mode and of each other.
+- **Export and import** — a program, or all of them, written to a file you
+  choose and read back later. Import treats the file as untrusted and reports
+  exactly what it added and what it skipped.
 - **Steps reference the track itself**, not its position, so reordering or
   renaming the library never breaks a program. Remove a track a program uses
   and the step is flagged *missing* and skipped rather than stopping the run.
@@ -111,4 +127,17 @@ No network permission, no accounts, no analytics. Nothing leaves the phone.
 | `Ui` / `Ico` | palette, widget factory, hand-drawn vector icons |
 | `Fmt` / `HelpText` | formatting and the in-app guide |
 
-Min SDK 26, target SDK 34. Tested on a Galaxy A55 running Android 16.
+| `Themes` | the colour and look pickers |
+| `Backup` | export and import |
+
+Min SDK 26 (Android 8.0). The build targets the newest platform installed in
+your SDK. Developed and tested on a Galaxy A55 (Android 16) and a Xiaomi
+2302EPCC4I (Android 13).
+
+## Publishing
+
+- [RELEASING.md](RELEASING.md) — upload key, target API, signed builds, and
+  what Google Play asks for.
+- [PRIVACY.md](PRIVACY.md) — short, because Riola has no internet permission
+  and collects nothing.
+- [LICENSE](LICENSE) — MIT.
