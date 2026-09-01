@@ -893,6 +893,72 @@ public final class Store {
         sp(c).edit().putString("programs", arr.toString()).apply();
     }
 
+    // ---- backup ----------------------------------------------------------
+    /** The whole library and every program, as readable json. */
+    public static String backup(Context c) {
+        try {
+            JSONObject o = new JSONObject();
+            o.put("riola", 1);
+            o.put("saved", System.currentTimeMillis());
+            JSONArray lib = new JSONArray();
+            for (Track t : LIB) {
+                JSONObject j = new JSONObject();
+                j.put("u", t.uri);
+                j.put("t", t.title);
+                j.put("d", t.durMs);
+                lib.put(j);
+            }
+            o.put("lib", lib);
+            JSONArray progs = new JSONArray();
+            for (Program p : PROGRAMS) progs.put(p.toJson());
+            o.put("programs", progs);
+            return o.toString(2);
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /**
+     * Adds everything in a backup alongside what is already here; nothing is
+     * overwritten. Returns {programs added, tracks added}.
+     */
+    public static int[] restore(Context c, String json) {
+        int progs = 0, tracks = 0;
+        try {
+            JSONObject o = new JSONObject(json);
+            JSONArray lib = o.optJSONArray("lib");
+            if (lib != null) {
+                for (int i = 0; i < lib.length(); i++) {
+                    JSONObject j = lib.optJSONObject(i);
+                    if (j == null) continue;
+                    String uri = j.optString("u", "");
+                    if (uri.length() == 0 || byUri(uri) != null) continue;
+                    LIB.add(new Track(uri, j.optString("t", "track"), j.optLong("d", 0)));
+                    tracks++;
+                }
+            }
+            JSONArray arr = o.optJSONArray("programs");
+            if (arr != null) {
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject j = arr.optJSONObject(i);
+                    if (j == null) continue;
+                    Program p = Program.fromJson(j);
+                    if (program(p.id) != null) {          // same program restored twice
+                        p.id = Program.blank(p.name).id;
+                        p.name = p.name + " (restored)";
+                    }
+                    PROGRAMS.add(p);
+                    progs++;
+                }
+            }
+        } catch (Exception e) {
+            return new int[]{ -1, -1 };
+        }
+        saveLib(c);
+        savePrograms(c);
+        return new int[]{ progs, tracks };
+    }
+
     /** A ready made program so a new user can hear something immediately. */
     public static Program sample() {
         Program p = Program.blank("My first program");
@@ -2175,6 +2241,7 @@ public class Engine {
         if (!running || paused == p) return;
         paused = p;
         st.paused = p;
+        if (p) bell.stop();     // a chime from a previous step can still be ringing
         MediaPlayer m = mp;
         if (m != null) {
             try {
@@ -3589,7 +3656,7 @@ import java.util.List;
 /** Home: the saved programs, each with a play button. */
 public class MainActivity extends Activity implements PlayerBar.Host {
 
-    private static final int REQ_NOTIF = 103;
+    private static final int REQ_NOTIF = 103, REQ_EXPORT = 201, REQ_IMPORT = 202;
 
     private Prefs prefs;
     private Engine eng;
@@ -3969,6 +4036,68 @@ public class MainActivity extends Activity implements PlayerBar.Host {
     }
 
     // ======================================================================
+    // backup
+    // ======================================================================
+    private void exportPrograms() {
+        if (Store.PROGRAMS.isEmpty()) { Ui.toast(this, "Nothing to back up yet"); return; }
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("application/json")
+                .putExtra(Intent.EXTRA_TITLE, "riola-backup.json");
+        try { startActivityForResult(i, REQ_EXPORT); }
+        catch (Exception e) { Ui.toast(this, "No file picker on this device"); }
+    }
+
+    private void importPrograms() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("*/*");
+        try { startActivityForResult(i, REQ_IMPORT); }
+        catch (Exception e) { Ui.toast(this, "No file picker on this device"); }
+    }
+
+    @Override
+    protected void onActivityResult(int req, int result, Intent data) {
+        super.onActivityResult(req, result, data);
+        if (result != RESULT_OK || data == null || data.getData() == null) return;
+        android.net.Uri uri = data.getData();
+
+        if (req == REQ_EXPORT) {
+            java.io.OutputStream out = null;
+            try {
+                out = getContentResolver().openOutputStream(uri);
+                out.write(Store.backup(this).getBytes("UTF-8"));
+                Ui.toast(this, "Backed up " + Store.PROGRAMS.size() + " program(s)");
+            } catch (Exception e) {
+                Ui.toast(this, "Could not write that file");
+            } finally {
+                if (out != null) try { out.close(); } catch (Exception e) { /* ignore */ }
+            }
+
+        } else if (req == REQ_IMPORT) {
+            java.io.InputStream in = null;
+            try {
+                in = getContentResolver().openInputStream(uri);
+                java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+                byte[] chunk = new byte[8192];
+                int n;
+                while ((n = in.read(chunk)) > 0) buf.write(chunk, 0, n);
+                int[] added = Store.restore(this, new String(buf.toByteArray(), "UTF-8"));
+                if (added[0] < 0) {
+                    Ui.toast(this, "That does not look like a Riola backup");
+                } else {
+                    Ui.toast(this, "Restored " + added[0] + " program(s) and " + added[1] + " track(s)");
+                    refresh();
+                }
+            } catch (Exception e) {
+                Ui.toast(this, "Could not read that file");
+            } finally {
+                if (in != null) try { in.close(); } catch (Exception e) { /* ignore */ }
+            }
+        }
+    }
+
+    // ======================================================================
     // dialogs
     // ======================================================================
     private void help() {
@@ -4051,6 +4180,31 @@ public class MainActivity extends Activity implements PlayerBar.Host {
         }));
         TextView note = Ui.tv(this, "Set the stop timer to 0 to switch it off.", 11, Ui.DIM, false);
         box.addView(note);
+
+        box.addView(Ui.divider(this));
+        box.addView(Ui.tv(this, "BACKUP", 11, Ui.DIM, true));
+        LinearLayout backup = Ui.row(this);
+        Ui.margin(this, backup, 0, 8, 0, 0);
+        LinearLayout save = Ui.btn(this, "Back up", Ico.SAVE, Ui.SECONDARY, new View.OnClickListener() {
+            public void onClick(View v) {
+                if (holder[0] != null) holder[0].dismiss();
+                exportPrograms();
+            }
+        });
+        save.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        Ui.margin(this, save, 0, 0, 8, 0);
+        backup.addView(save);
+        LinearLayout load = Ui.btn(this, "Restore", Ico.OPEN, Ui.SECONDARY, new View.OnClickListener() {
+            public void onClick(View v) {
+                if (holder[0] != null) holder[0].dismiss();
+                importPrograms();
+            }
+        });
+        load.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        backup.addView(load);
+        box.addView(backup);
+        box.addView(Ui.tv(this, "Writes every program and the track list to a file you choose. "
+                + "Restoring adds them back alongside whatever is already here.", 11, Ui.DIM, false));
 
         box.addView(Ui.divider(this));
         box.addView(Ui.btn(this, "Reset settings to defaults", 0, Ui.DANGER, new View.OnClickListener() {
