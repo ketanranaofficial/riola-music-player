@@ -3149,12 +3149,20 @@ public final class Runner {
         new Thread(new Runnable() {
             public void run() {
                 final List<String> bad = new ArrayList<String>();
+                // a program often uses the same file many times over; opening it
+                // once per step would be pointless io
+                java.util.HashMap<String, Boolean> seen = new java.util.HashMap<String, Boolean>();
                 int playable = 0;
                 for (int i = 0; i < p.steps.size(); i++) {
                     Step s = p.steps.get(i);
                     if (!s.enabled) continue;
                     if (!s.needsTrack()) { playable++; continue; }
-                    if (s.track() == null || !Store.readable(a, s.trackUri)) {
+                    Boolean known = seen.get(s.trackUri);
+                    if (known == null) {
+                        known = Boolean.valueOf(s.track() != null && Store.readable(a, s.trackUri));
+                        seen.put(s.trackUri, known);
+                    }
+                    if (!known.booleanValue()) {
                         String name = s.trackName == null || s.trackName.length() == 0
                                 ? "unknown track" : s.trackName;
                         bad.add("Step " + (i + 1) + "  -  " + name);
@@ -4077,6 +4085,9 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
 
     @Override
     protected void onPause() {
+        ui.removeCallbacks(clearUndo);
+        undoStep = null;
+        undoAt = -1;
         if (prog != null) {
             bar.detach();
             // Every edit already saves through save(); writing again here would
@@ -5047,6 +5058,7 @@ public class LibraryActivity extends Activity implements PlayerBar.Host {
 
     private boolean add(Uri u, String name) {
         String s = u.toString();
+        Store.MISSING.remove(s);      // adding it back clears any earlier failure
         if (Store.byUri(s) != null) return false;
         Store.LIB.add(new Track(s, name, 0));
         return true;
