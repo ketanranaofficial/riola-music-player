@@ -3772,7 +3772,9 @@ public final class Backup {
             return;
         }
 
-        int tracks = 0;
+        // held back until we know at least one program survived, so a junk file
+        // cannot litter the library on its way to being rejected
+        List<Track> incoming = new ArrayList<Track>();
         JSONArray lib = root.optJSONArray("lib");
         if (lib != null) {
             for (int i = 0; i < lib.length(); i++) {
@@ -3780,13 +3782,12 @@ public final class Backup {
                 if (j == null) continue;
                 String u = j.optString("u", "");
                 if (u.length() == 0 || Store.byUri(u) != null) continue;
-                Store.LIB.add(new Track(u, j.optString("t", "track"), j.optLong("d", 0)));
-                tracks++;
+                incoming.add(new Track(u, j.optString("t", "track"), j.optLong("d", 0)));
             }
         }
 
         int added = 0, skipped = 0;
-        boolean anyMissing = false;
+        List<Program> fresh = new ArrayList<Program>();
         for (int i = 0; i < arr.length(); i++) {
             JSONObject j = arr.optJSONObject(i);
             if (j == null) { skipped++; continue; }
@@ -3800,19 +3801,27 @@ public final class Backup {
                 }
                 p.updated = System.currentTimeMillis();
                 Store.PROGRAMS.add(p);
-                if (p.hasMissing()) anyMissing = true;
+                fresh.add(p);
                 added++;
             } catch (Exception e) {
                 skipped++;
             }
         }
 
-        Store.saveLib(a);
-        Store.savePrograms(a);
-
         if (added == 0) {
             fail(a, "Nothing in that file could be read as a program.");
             return;
+        }
+
+        int tracks = incoming.size();
+        Store.LIB.addAll(incoming);
+        Store.saveLib(a);
+        Store.savePrograms(a);
+
+        // only meaningful once the imported tracks are actually in the library
+        boolean anyMissing = false;
+        for (int i = 0; i < fresh.size(); i++) {
+            if (fresh.get(i).hasMissing()) { anyMissing = true; break; }
         }
 
         StringBuilder msg = new StringBuilder();
