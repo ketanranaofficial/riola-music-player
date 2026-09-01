@@ -3554,7 +3554,8 @@ public final class Pickers {
         in.setSingleLine(true);
         in.setHint(hint);
         in.setText(value == null ? "" : value);
-        in.setSelection(in.getText().length());
+        in.setSelectAllOnFocus(true);
+        in.selectAll();          // typing replaces the suggestion instead of appending
         in.setTextColor(Ui.TXT);
         in.setHintTextColor(Ui.DIM);
         LinearLayout box = Ui.col(a);
@@ -4429,9 +4430,23 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
     private boolean dirty;
     private Step undoStep;          // last deleted, kept briefly so it can come back
     private int undoAt = -1;
+    private int undoLeft;           // seconds still on the clock
+    private TextView undoLabel;
+    private static final int UNDO_SECONDS = 20;
     private final android.os.Handler ui = new android.os.Handler(android.os.Looper.getMainLooper());
-    private final Runnable clearUndo = new Runnable() {
-        public void run() { undoStep = null; undoAt = -1; refresh(); }
+    private final Runnable undoTick = new Runnable() {
+        public void run() {
+            if (undoStep == null) return;
+            undoLeft--;
+            if (undoLeft <= 0) {
+                undoStep = null;
+                undoAt = -1;
+                refresh();
+                return;
+            }
+            if (undoLabel != null) undoLabel.setText("Step removed  .  " + undoLeft + "s");
+            ui.postDelayed(this, 1000);
+        }
     };
 
     @Override
@@ -4460,9 +4475,10 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
 
     @Override
     protected void onPause() {
-        ui.removeCallbacks(clearUndo);
+        ui.removeCallbacks(undoTick);
         undoStep = null;
         undoAt = -1;
+        undoLabel = null;
         if (prog != null) {
             bar.detach();
             // Every edit already saves through save(); writing again here would
@@ -4614,16 +4630,16 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
         r.setClickable(true);
         r.setContentDescription("Undo removing the step");
         r.setOnClickListener(undo);
-        TextView t = Ui.tv(this, "Step removed", 13, Ui.TXT, false);
-        t.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
-        r.addView(t);
+        undoLabel = Ui.tv(this, "Step removed  .  " + Math.max(1, undoLeft) + "s", 13, Ui.TXT, false);
+        undoLabel.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
+        r.addView(undoLabel);
         r.addView(Ui.btn(this, "Undo", Ico.RESET, Ui.SECONDARY, undo));
         return r;
     }
 
     /** Puts the last deleted step back where it was. */
     private void restoreStep() {
-        ui.removeCallbacks(clearUndo);
+        ui.removeCallbacks(undoTick);
         Step back = undoStep;
         int at = undoAt;
         undoStep = null;
@@ -4642,8 +4658,9 @@ public class EditorActivity extends Activity implements PlayerBar.Host {
     private void removeStep(int index) {
         undoStep = prog.steps.remove(index);
         undoAt = index;
-        ui.removeCallbacks(clearUndo);
-        ui.postDelayed(clearUndo, 15000);
+        undoLeft = UNDO_SECONDS;
+        ui.removeCallbacks(undoTick);
+        ui.postDelayed(undoTick, 1000);
         save();
         refresh();
     }
