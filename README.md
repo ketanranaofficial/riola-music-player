@@ -40,17 +40,25 @@ edit it, tap play to run it.
 **A program** is an ordered list of steps plus a repeat count for the whole
 list (once, a few times, or forever).
 
-**A step** is one of three things:
+**A step** is one of four things:
 
 | Step | What it does |
 | --- | --- |
 | Whole track | plays a track start to finish |
 | Section | plays one A-B slice of a track |
-| Silence | plays nothing |
+| Silence | plays nothing (and can end with a bell) |
+| Bell | a soft chime to mark a change |
 
 Every playing step repeats either **a number of times** or **for a length of
 time**, and can carry a gap between repeats, its own speed, its own volume, and
 an on/off switch so you can park a step without deleting it.
+
+**The bell** is synthesised at runtime, so the APK still carries no audio
+assets. Six partials over a fundamental, where the bright ones decay in under a
+second and the low ones ring on for four to six, an 8 ms ramped attack so there
+is no click, and a second prime a hair sharp for a slow shimmer. Three voices,
+one to nine rings with a gap you choose. It is built to mark a moment without
+jolting you — which matters when the whole point is that your eyes are closed.
 
 **Sections** can be typed as minutes and seconds, or marked by ear: play the
 track, tap *Set A* and *Set B*, nudge each mark by a second, and loop the slice
@@ -70,7 +78,13 @@ while you fine-tune it.
   so long silences stay exact.
 - **While running** — pause/resume, previous/next step, tap any step to jump to
   it, scrub inside the current track, and see time left in the step and in the
-  whole program.
+  whole program. The editor scrolls itself to keep the playing step in view.
+- **Full screen player** — tap the transport strip for large controls you can
+  find without looking, the time in big figures, and a moon button that dims
+  the screen to near black for a dark room.
+- **Missing files are caught before playback**, not twenty minutes into a
+  session: Riola opens every track a program needs first and names the steps
+  that cannot play.
 - **Settings** — dark/light, keep screen on, master volume and speed, loop-edge
   fade, a count-in before the first step, and a stop-after timer.
 
@@ -82,6 +96,9 @@ No network permission, no accounts, no analytics. Nothing leaves the phone.
 | --- | --- |
 | `MainActivity` | home: saved programs, live step list, settings |
 | `EditorActivity` | the tap-to-build program editor |
+| `NowPlayingActivity` | the full screen player |
+| `Bell` | the synthesised chime |
+| `Runner` | pre-play checks, then hands the program to the engine |
 | `LibraryActivity` | the track library |
 | `StepSheet` | the editor for one step |
 | `AbDialog` | mark a section by ear |
