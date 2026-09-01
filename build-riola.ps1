@@ -5037,8 +5037,8 @@ public class MainActivity extends Activity implements PlayerBar.Host {
             }
         }));
         box.addView(Ui.gap(this, 6));
-        box.addView(Ui.tv(this, "Riola 4.0  -  no ads, no network, no accounts.", 11, Ui.DIM, false));
-        box.addView(Ui.gap(this, 6));
+        box.addView(Ui.tv(this, "Riola  -  no ads, no network, no accounts.", 11, Ui.DIM, false));
+        box.addView(Ui.gap(this, 20));
 
         ScrollView sv = new ScrollView(this);
         sv.addView(box, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
@@ -5842,7 +5842,7 @@ public final class StepSheet {
                 step.enabled, new Ui.OnToggle() {
             public void set(boolean v) { step.enabled = v; }
         }));
-        box.addView(Ui.gap(a, 8));
+        box.addView(Ui.gap(a, 20));
     }
 }
 '@
