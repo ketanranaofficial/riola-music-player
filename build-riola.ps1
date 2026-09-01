@@ -1296,21 +1296,31 @@ public final class Ui {
 
     public static View switchRow(Context c, String label, String sub, boolean value, final OnToggle cb) {
         LinearLayout r = row(c);
-        margin(c, r, 0, 6, 0, 6);
+        margin(c, r, 0, 4, 0, 4);
+        int pad = dp(c, 6);
+        r.setPadding(pad, pad, pad, pad);
         LinearLayout col = col(c);
         col.setLayoutParams(lpw(0, WRAP, 1f));
         col.addView(tv(c, label, 14, TXT, false));
         if (sub != null && sub.length() > 0) {
-            TextView s = tv(c, sub, 11.5f, DIM, false);
-            col.addView(s);
+            col.addView(tv(c, sub, 11.5f, DIM, false));
         }
         r.addView(col);
-        Switch s = new Switch(c);
-        s.setChecked(value);
-        s.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+        final Switch sw = new Switch(c);
+        sw.setChecked(value);
+        sw.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             public void onCheckedChanged(CompoundButton b, boolean v) { cb.set(v); }
         });
-        r.addView(s);
+        r.addView(sw);
+
+        // The label looks tappable, so it has to be tappable: hitting anywhere
+        // on the row flips the switch.
+        r.setBackground(ripple(rr(c, 0x00000000, 10)));
+        r.setClickable(true);
+        r.setContentDescription(label);
+        r.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { buzz(v); sw.toggle(); }
+        });
         return r;
     }
 
@@ -5282,18 +5292,9 @@ public final class AbDialog {
             }
         }));
 
-        LinearLayout loopRow = Ui.row(act);
-        Ui.margin(act, loopRow, 0, 4, 0, 0);
-        TextView loopLbl = Ui.tv(act, "Loop A-B while listening", 13, Ui.DIM, false);
-        loopLbl.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
-        loopRow.addView(loopLbl);
-        Switch loopSw = new Switch(act);
-        loopSw.setChecked(true);
-        loopSw.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
-            public void onCheckedChanged(android.widget.CompoundButton c, boolean v) { loopAb[0] = v; }
-        });
-        loopRow.addView(loopSw);
-        box.addView(loopRow);
+        box.addView(Ui.switchRow(act, "Loop A-B while listening", null, true, new Ui.OnToggle() {
+            public void set(boolean v) { loopAb[0] = v; }
+        }));
 
         LinearLayout jump = Ui.row(act);
         jump.addView(Ui.chip(act, "jump to A", false, new View.OnClickListener() {
