@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="RiolaDialog" parent="@android:style/Theme.Material.Dialog.Alert">
+        <item name="android:backgroundDimAmount">0.62</item>
+    </style>
+    <style name="RiolaDialogLight" parent="@android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:backgroundDimAmount">0.55</item>
+    </style>
+</resources>

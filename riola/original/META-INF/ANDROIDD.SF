@@ -1,0 +1,47 @@
+Signature-Version: 1.0
+Created-By: 1.0 (Android)
+SHA-256-Digest-Manifest: XwgSNrcVAHpyWi0cysoVZYuGIRwDh5bCmgpRCxyjDyI=
+X-Android-APK-Signed: 2, 3
+
+Name: AndroidManifest.xml
+SHA-256-Digest: UAM+dWDaUJ4e3PHqRFKyOMflrepX9cbDHOQDeNujR6Y=
+
+Name: classes.dex
+SHA-256-Digest: KNstH5e5klEksmPtXAVejrbgWp5vTnGrZhOuxaDT9vA=
+
+Name: res/drawable/ic_launcher_bg.xml
+SHA-256-Digest: ZB02ufyyI2zefylylX0H9NxPRbiqLe7sb/WKHuNzSK0=
+
+Name: res/drawable/ic_launcher_fg.xml
+SHA-256-Digest: 6iyEuKKFuF7fj8BxSjmZOj99QAklBBm8qbPqKLP3MJE=
+
+Name: res/drawable/ic_launcher_mono.xml
+SHA-256-Digest: Hcd6MQv2Dkv381bFYJ85koJARjsMfmyThdJzCOvxLbg=
+
+Name: res/drawable/ic_next.xml
+SHA-256-Digest: jbBVmyJmJcdz4y/sYN1oYOMiuxeluj2bFQmd8to6HVY=
+
+Name: res/drawable/ic_note.xml
+SHA-256-Digest: edwqFrN41XZNTqnW96GJCCgF0KLt9KtTbey+GzqZhUg=
+
+Name: res/drawable/ic_pause.xml
+SHA-256-Digest: upafZoJifcwz9tZRV2jJce6+ENy5W9u7jeuvGBEIngk=
+
+Name: res/drawable/ic_play.xml
+SHA-256-Digest: IfqAxZbvu4xsKT35m8jXjr9GmraYr7QAMcDJvCzapqc=
+
+Name: res/drawable/ic_prev.xml
+SHA-256-Digest: m1W1GyIc3c/rutVPjYrPuK9GXQ7peivwA09vmTzBGRc=
+
+Name: res/drawable/ic_stop.xml
+SHA-256-Digest: +RpErIOeRuY6/cWcwJexpn5g+4GWlS2T6rnRlEtT998=
+
+Name: res/mipmap-anydpi-v26/ic_launcher.xml
+SHA-256-Digest: 8dbbRj5rU4/IlclLGdOq0paOzkrrWcWJ70UyAxAR2+s=
+
+Name: res/mipmap-anydpi-v26/ic_launcher_round.xml
+SHA-256-Digest: iKNT3s/hTUGvhBzN9EI76bM101RI1CGzs+4vfH0MqpU=
+
+Name: resources.arsc
+SHA-256-Digest: Vp+m4rAgm5t7mXDMwYustE7EDef4TwOxRwRAmsnasRM=
+

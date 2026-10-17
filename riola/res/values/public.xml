@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <public type="drawable" name="ic_launcher_bg" id="0x7f010000" />
+    <public type="drawable" name="ic_launcher_fg" id="0x7f010001" />
+    <public type="drawable" name="ic_launcher_mono" id="0x7f010002" />
+    <public type="drawable" name="ic_next" id="0x7f010003" />
+    <public type="drawable" name="ic_note" id="0x7f010004" />
+    <public type="drawable" name="ic_pause" id="0x7f010005" />
+    <public type="drawable" name="ic_play" id="0x7f010006" />
+    <public type="drawable" name="ic_prev" id="0x7f010007" />
+    <public type="drawable" name="ic_stop" id="0x7f010008" />
+    <public type="mipmap" name="ic_launcher" id="0x7f020000" />
+    <public type="mipmap" name="ic_launcher_round" id="0x7f020001" />
+    <public type="string" name="app_name" id="0x7f030000" />
+    <public type="style" name="RiolaDialog" id="0x7f040000" />
+    <public type="style" name="RiolaDialogLight" id="0x7f040001" />
+</resources>
