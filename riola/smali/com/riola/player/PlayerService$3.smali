@@ -107,6 +107,18 @@
     .line 241
     iget-object p1, p0, Lcom/riola/player/PlayerService$3;->this$0:Lcom/riola/player/PlayerService;
 
+    invoke-static {p1}, Lcom/riola/player/PlayerService;->access$200(Lcom/riola/player/PlayerService;)Lcom/riola/player/Prefs;
+
+    move-result-object p1
+
+    invoke-virtual {p1}, Lcom/riola/player/Prefs;->pauseOnFocus()Z
+
+    move-result p1
+
+    if-eqz p1, :cond_3
+
+    iget-object p1, p0, Lcom/riola/player/PlayerService$3;->this$0:Lcom/riola/player/PlayerService;
+
     invoke-static {p1}, Lcom/riola/player/PlayerService;->access$000(Lcom/riola/player/PlayerService;)Lcom/riola/player/Engine;
 
     move-result-object p1
@@ -152,6 +164,18 @@
     if-ne p1, v0, :cond_2
 
     .line 246
+    iget-object p1, p0, Lcom/riola/player/PlayerService$3;->this$0:Lcom/riola/player/PlayerService;
+
+    invoke-static {p1}, Lcom/riola/player/PlayerService;->access$200(Lcom/riola/player/PlayerService;)Lcom/riola/player/Prefs;
+
+    move-result-object p1
+
+    invoke-virtual {p1}, Lcom/riola/player/Prefs;->pauseOnFocus()Z
+
+    move-result p1
+
+    if-eqz p1, :cond_3
+
     iget-object p1, p0, Lcom/riola/player/PlayerService$3;->this$0:Lcom/riola/player/PlayerService;
 
     invoke-static {p1}, Lcom/riola/player/PlayerService;->access$000(Lcom/riola/player/PlayerService;)Lcom/riola/player/Engine;

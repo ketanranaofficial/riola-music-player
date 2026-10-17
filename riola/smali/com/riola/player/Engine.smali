@@ -3337,21 +3337,7 @@
 
     .line 556
     :cond_15
-    if-lez v5, :cond_16
-
-    const-wide/16 v0, 0x0
-
-    cmp-long v5, v28, v0
-
-    if-gtz v5, :cond_16
-
-    invoke-direct/range {p0 .. p0}, Lcom/riola/player/Engine;->pausePlayer()V
-
-    const/high16 v0, 0x3f800000    # 1.0f
-
-    invoke-direct {v6, v0}, Lcom/riola/player/Engine;->setGain(F)V
-
-    return-void
+    goto/16 :cond_16
 
     .line 558
     :cond_16
