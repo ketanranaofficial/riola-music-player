@@ -17,25 +17,29 @@ a tap.
 | ![Home](docs/01-home.png) | ![Editor](docs/02-editor.png) | ![Looks](docs/03-looks.png) |
 
 
-## The whole app is one script
+## Building
 
-`build-riola.ps1` writes every source file and compiles a signed APK with the
-Android SDK command-line tools. No Gradle, no AndroidX, no third-party
-libraries — just `aapt2`, `javac`, `d8`, `zipalign` and `apksigner` against
-`android.jar`.
+Plain Java against `android.jar`: no Gradle, no AndroidX, no third-party
+libraries. `build.sh` drives `aapt2`, `javac`, `d8`, `zipalign` and `apksigner`
+and writes a signed APK to `build/riola.apk`.
 
-```powershell
-.\build-riola.ps1              # write sources + build riola\riola.apk
-.\build-riola.ps1 -Clean       # wipe the output tree first
-.\build-riola.ps1 -SourcesOnly # only write the sources
-.\build-riola.ps1 -Install     # build, then adb install -r
+```bash
+./build.sh              # build/riola.apk, signed with your debug key
+./build.sh --install    # build, then adb install -r
+./build.sh --clean      # wipe build/ first
 ```
 
-Requirements: Android SDK with `platforms\android-34` and build-tools 33+, a
-JDK (17 works), and a debug keystore (the script creates one if missing).
+Requirements, on Ubuntu or any Linux:
 
-Everything under `riola/` is generated, so it is git-ignored. Edit the script,
-not the generated Java.
+- a JDK 17 or newer: `sudo apt install openjdk-17-jdk-headless`
+- the Android SDK build-tools (33+) and one platform (`android-34` or newer).
+  `build.sh` looks in `$ANDROID_HOME` (default `~/Android/Sdk`). If your tools
+  live elsewhere, point `BUILD_TOOLS` at the folder holding `aapt2` and `d8`,
+  and `ANDROID_JAR` at an `android.jar`.
+- `adb` and a phone with USB debugging, for `--install`
+
+A debug keystore is created at `~/.android/debug.keystore` if you have none.
+Everything under `build/` is generated and git-ignored; the source is `app/`.
 
 ## How a program is built
 
@@ -106,7 +110,7 @@ while you fine-tune it.
 
 No network permission, no accounts, no analytics. Nothing leaves the phone.
 
-## Layout of the generated code
+## Layout of the code (`app/src/com/riola/player/`)
 
 | File | What it does |
 | --- | --- |
@@ -126,9 +130,11 @@ No network permission, no accounts, no analytics. Nothing leaves the phone.
 | `Store` / `Prefs` | persistence (SharedPreferences + JSON) |
 | `Ui` / `Ico` | palette, widget factory, hand-drawn vector icons |
 | `Fmt` / `HelpText` | formatting and the in-app guide |
-
 | `Themes` | the colour and look pickers |
 | `Backup` | export and import |
+| `Track` / `TrackPicker` | a library track, and the multi-select track picker |
+
+Resources and the manifest are in `app/res/` and `app/AndroidManifest.xml`.
 
 Min SDK 26 (Android 8.0). The build targets the newest platform installed in
 your SDK. Developed and tested on a Galaxy A55 (Android 16) and a Xiaomi
