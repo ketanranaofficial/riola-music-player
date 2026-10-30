@@ -3558,12 +3558,12 @@ public class PlayerService extends Service implements Engine.Listener {
                         engine.setPaused(true);
                     }
                 } else if (change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
-                    if (engine.isRunning() && !engine.isPaused()) {
+                    if (prefs.pauseOnFocus() && engine.isRunning() && !engine.isPaused()) {
                         pausedByFocus = true;
                         engine.setPaused(true);
                     }
                 } else if (change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
-                    engine.setDuck(0.25f);
+                    if (prefs.pauseOnFocus()) engine.setDuck(0.25f);
                 } else if (change == AudioManager.AUDIOFOCUS_GAIN) {
                     engine.setDuck(1f);
                     if (pausedByFocus) {
