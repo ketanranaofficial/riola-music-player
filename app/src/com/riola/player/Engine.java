@@ -320,9 +320,18 @@ public class Engine {
             if (s.type == Step.SILENCE) {
                 pausePlayer();
                 silence(s.durMs, rest, true);
-                // the chime rings on into whatever comes next, which is exactly
-                // what you want when the next step is more silence
-                if (s.endBell && !stopReq && skip == 0) bell.ring(s.tone, vol * stepVol * duck);
+                if (s.endBell && !stopReq && skip == 0) {
+                    bell.ring(s.tone, vol * stepVol * duck);
+                    // The chime rings on into more silence, which is what you
+                    // want there. Anything else waits for it to die away first,
+                    // or it would sound over the next track, and a bell on the
+                    // last step would be cut off the moment the program ends.
+                    if (!nextStepIsSilence(idx)) {
+                        long ring = Bell.lengthMs(s.tone);
+                        log("  (letting the " + Bell.toneName(s.tone) + " bell ring out, " + ring + " ms)");
+                        silence(ring, rest, false);
+                    }
+                }
             } else if (s.type == Step.BELL) {
                 pausePlayer();
                 bellStep(s, rest);
@@ -362,6 +371,17 @@ public class Engine {
                 for (Listener l : listeners) l.onFinished(done);
             }
         });
+    }
+
+    /** Is the next step to play one that is only silence? False when nothing follows. */
+    private boolean nextStepIsSilence(int at) {
+        int[] o = order;
+        if (o == null) return false;
+        for (int i = at + 1; i < o.length; i++) {
+            Step n = steps.get(o[i]);
+            if (n.enabled) return n.type == Step.SILENCE;
+        }
+        return false;
     }
 
     private boolean expired() {
