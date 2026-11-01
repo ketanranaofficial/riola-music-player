@@ -18,8 +18,9 @@
 #       ANDROID_JAR   path to android.jar          (else $ANDROID_HOME/platforms/android-N/android.jar)
 #       BUILD_TOOLS   dir holding aapt2, d8, ...   (else newest $ANDROID_HOME/build-tools/*)
 #     ANDROID_HOME defaults to $ANDROID_SDK_ROOT, then ~/Android/Sdk.
-#   - Release signing reads RIOLA_STOREPASS (and optionally RIOLA_KEYPASS)
-#     from the environment so passwords stay out of the process list.
+#   - Release signing asks for the keystore password in the terminal. For scripts,
+#     RIOLA_STOREPASS (and optionally RIOLA_KEYPASS) in the environment is read
+#     instead, so the password is never on the command line.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -27,8 +28,8 @@ OUT=build
 APK_NAME=riola.apk
 MIN_SDK=26
 TARGET_SDK=0
-VERSION_CODE=5
-VERSION_NAME=1.1
+VERSION_CODE=6
+VERSION_NAME=1.2
 CLEAN=0 INSTALL=0 RELEASE=0
 KEYSTORE='' KEY_ALIAS=''
 APP_ID='' DEBUGGABLE=0
@@ -97,7 +98,15 @@ fi
 if [ "$RELEASE" = 1 ]; then
     [ -n "$KEYSTORE" ] && [ -f "$KEYSTORE" ] || die "--release needs --keystore pointing at your upload key. See RELEASING.md."
     [ -n "$KEY_ALIAS" ] || die "--release needs --alias."
-    [ -n "${RIOLA_STOREPASS:-}" ] || die "--release needs the RIOLA_STOREPASS environment variable."
+    if [ -z "${RIOLA_STOREPASS:-}" ]; then
+        # No password in the environment: ask for it, with nothing echoed and nothing
+        # left in the shell history. This works the same whichever shell started the script.
+        [ -t 0 ] || die "--release needs the keystore password: set RIOLA_STOREPASS, or run this in a terminal and it will ask."
+        read -rsp "Password for $KEYSTORE: " RIOLA_STOREPASS
+        echo
+        [ -n "$RIOLA_STOREPASS" ] || die "No password entered."
+        export RIOLA_STOREPASS
+    fi
     export RIOLA_KEYPASS=${RIOLA_KEYPASS:-$RIOLA_STOREPASS}
     STORE_PASS=env:RIOLA_STOREPASS
     KEY_PASS=env:RIOLA_KEYPASS
