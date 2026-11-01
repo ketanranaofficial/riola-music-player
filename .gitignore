@@ -22,3 +22,7 @@ key.properties
 .claude/
 .riola-local/
 NOTES.local.md
+
+# Python bytecode from the tools
+__pycache__/
+*.pyc
