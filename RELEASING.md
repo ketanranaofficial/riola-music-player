@@ -62,7 +62,7 @@ style distribution and sideloading.
   permission, so this is honest and easy.
 - **Content rating questionnaire** — everyone / no sensitive content.
 - **Store listing** — short description, full description, and graphics:
-  - App icon, 512 × 512 PNG
+  - App icon, 512 × 512 PNG (`docs/icon-512.png` is ready)
   - Feature graphic, 1024 × 500
   - At least two phone screenshots (there are some in `docs/`)
 - **Target audience** — not designed for children, to avoid the Families

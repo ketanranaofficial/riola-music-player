@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.png" width="128" alt="Riola logo"></p>
+
 # Riola
 
 A programmable music player for Android. Add some tracks, then build a program
@@ -143,6 +145,25 @@ Resources and the manifest are in `app/res/` and `app/AndroidManifest.xml`.
 Min SDK 26 (Android 8.0). The build targets the newest platform installed in
 your SDK. Developed and tested on a Galaxy A55 (Android 16) and a Xiaomi
 2302EPCC4I (Android 13).
+
+## The logo
+
+A music note inside a ring that is broken into two crescents. The ring is exact
+geometry (one outer circle, two mirrored crescents), the note is traced from the
+original artwork with its stem made truly vertical, and the colour runs from
+azure through aqua to mint.
+
+It is vector art, so there are no icon PNGs in the app: the launcher icon is an
+adaptive icon (`ic_launcher_bg`, `ic_launcher_fg` and a one-colour
+`ic_launcher_mono` for themed icons), the home screen header draws `ic_logo`, and
+the notification icon is the one-colour mark. `docs/icon-512.png` is the Play
+store icon.
+
+To change it, edit the numbers at the top of `tools/logo/design.py` (ring size,
+thickness, gap) or the colours in `tools/logo/render.py`, then run
+`python3 tools/logo/export_android.py .` (needs `numpy` and `pillow`). That
+rewrites the drawables and the two PNGs. `tools/logo/trace_note.py` is how the
+note was first traced from a reference image.
 
 ## Publishing
 

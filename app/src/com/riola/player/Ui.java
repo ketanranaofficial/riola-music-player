@@ -4,15 +4,18 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Context;
 import android.content.res.ColorStateList;
+import android.graphics.Outline;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.LayerDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewOutlineProvider;
 import android.widget.CompoundButton;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
@@ -551,6 +554,25 @@ public final class Ui {
             h.addView(iconBtn(a, Ico.BACK, TXT, 20, "Back", new View.OnClickListener() {
                 public void onClick(View v) { a.finish(); }
             }));
+        } else if (icoId == Ico.NOTE) {
+            // the home screen shows the Riola logo itself, on its own dark tile so it
+            // reads the same in every colour and look
+            ImageView logo = new ImageView(a);
+            LayerDrawable tile = new LayerDrawable(new Drawable[] {
+                    a.getResources().getDrawable(R.drawable.ic_launcher_bg, null),
+                    a.getResources().getDrawable(R.drawable.ic_logo, null) });
+            int inset = dp(a, 4);
+            tile.setLayerInset(1, inset, inset, inset, inset);
+            logo.setImageDrawable(tile);
+            logo.setLayoutParams(lp(dp(a, 40), dp(a, 40)));
+            final float radius = dp(a, 11);
+            logo.setOutlineProvider(new ViewOutlineProvider() {
+                public void getOutline(View v, Outline o) { o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), radius); }
+            });
+            logo.setClipToOutline(true);
+            logo.setContentDescription("Riola");
+            h.addView(logo);
+            h.addView(hgap(a, 10));
         } else if (icoId > 0) {
             ImageView mark = icon(a, icoId, ACC, 20);
             int p = dp(a, 7);
