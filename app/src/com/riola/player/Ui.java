@@ -3,6 +3,7 @@ package com.riola.player;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.res.ColorStateList;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
@@ -13,6 +14,7 @@ import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.Button;
 import android.widget.CompoundButton;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
@@ -289,8 +291,31 @@ public final class Ui {
                       : android.R.style.Theme_Material_Light_NoActionBar;
     }
 
+    /**
+     * Every dialog in the app starts here. The dialog theme is a fixed style, so it cannot
+     * know the accent the user picked and its buttons would stay one default colour; they
+     * are tinted as the dialog is shown instead, which covers every dialog at once.
+     */
     public static AlertDialog.Builder dialog(Activity a) {
-        return new AlertDialog.Builder(a, dark ? R.style.RiolaDialog : R.style.RiolaDialogLight);
+        return new AlertDialog.Builder(a, dark ? R.style.RiolaDialog : R.style.RiolaDialogLight) {
+            @Override public AlertDialog create() {
+                AlertDialog d = super.create();
+                d.setOnShowListener(new DialogInterface.OnShowListener() {
+                    public void onShow(DialogInterface di) { tintButtons((AlertDialog) di); }
+                });
+                return d;
+            }
+        };
+    }
+
+    private static void tintButtons(AlertDialog d) {
+        ColorStateList text = new ColorStateList(
+                new int[][] { { -android.R.attr.state_enabled }, {} }, new int[] { DIM, ACC_TXT });
+        int[] which = { DialogInterface.BUTTON_POSITIVE, DialogInterface.BUTTON_NEGATIVE, DialogInterface.BUTTON_NEUTRAL };
+        for (int w : which) {
+            Button b = d.getButton(w);
+            if (b != null) b.setTextColor(text);
+        }
     }
 
     public static void toast(Context c, String s) { Toast.makeText(c, s, Toast.LENGTH_SHORT).show(); }
@@ -620,6 +645,11 @@ public final class Ui {
         }
         r.addView(col);
         final Switch sw = new Switch(c);
+        // A plain Switch takes its colour from the base theme, which knows nothing
+        // about the accent the user picked, so it is tinted here like the sliders.
+        int[][] on = { { android.R.attr.state_checked }, {} };
+        sw.setThumbTintList(new ColorStateList(on, new int[] { ACC_TXT, DIM }));
+        sw.setTrackTintList(new ColorStateList(on, new int[] { (ACC_TXT & 0x00FFFFFF) | 0x80000000, LINE }));
         sw.setChecked(value);
         sw.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             public void onCheckedChanged(CompoundButton b, boolean v) { cb.set(v); }
