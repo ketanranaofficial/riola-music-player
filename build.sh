@@ -7,6 +7,8 @@
 #   ./build.sh                    # debug-signed build/riola.apk
 #   ./build.sh --install          # build, then adb install -r
 #   ./build.sh --clean            # wipe build/ first
+#   ./build.sh --app-id com.riola.player.test --debuggable --out build/test
+#                                 # side-by-side test build; leaves the installed app alone
 #   ./build.sh --release --keystore ~/keys/riola-upload.jks --alias riola \
 #              --version-code 5 --version-name 1.1
 #
@@ -29,6 +31,7 @@ VERSION_CODE=4
 VERSION_NAME=1.0
 CLEAN=0 INSTALL=0 RELEASE=0
 KEYSTORE='' KEY_ALIAS=''
+APP_ID='' DEBUGGABLE=0
 
 die() { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
 say() { printf '\033[36m%s\033[0m\n' "$*"; }
@@ -44,6 +47,8 @@ while [ $# -gt 0 ]; do
         --version-code) VERSION_CODE=${2:?--version-code needs a number}; shift ;;
         --version-name) VERSION_NAME=${2:?--version-name needs a string}; shift ;;
         --target-sdk)   TARGET_SDK=${2:?--target-sdk needs a number}; shift ;;
+        --app-id)       APP_ID=${2:?--app-id needs a package name}; shift ;;
+        --debuggable)   DEBUGGABLE=1 ;;
         --out)          OUT=${2:?--out needs a directory}; shift ;;
         -h|--help)      sed -n '2,/^set -euo/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
         *)              die "unknown option: $1 (see --help)" ;;
@@ -135,8 +140,12 @@ say "[1/2] building"
 aapt2 compile --dir app/res -o "$OUT/compiled_res.zip"
 
 # link resources + manifest, emit R.java. Version and target come from here,
-# not from the manifest.
-aapt2 link -I "$ANDROID_JAR" --manifest app/AndroidManifest.xml -R "$OUT/compiled_res.zip" \
+# not from the manifest. --app-id renames the installed package only; the Java
+# code and R.java stay in com.riola.player.
+EXTRA=()
+[ -n "$APP_ID" ] && EXTRA+=(--rename-manifest-package "$APP_ID" --custom-package com.riola.player)
+[ "$DEBUGGABLE" = 1 ] && EXTRA+=(--debug-mode)
+aapt2 link "${EXTRA[@]}" -I "$ANDROID_JAR" --manifest app/AndroidManifest.xml -R "$OUT/compiled_res.zip" \
            --java "$OUT/gen" --auto-add-overlay \
            --min-sdk-version "$MIN_SDK" --target-sdk-version "$TARGET_SDK" \
            --version-code "$VERSION_CODE" --version-name "$VERSION_NAME" \
