@@ -155,14 +155,17 @@ azure through aqua to mint.
 
 It is vector art, so there are no icon PNGs in the app: the launcher icon is an
 adaptive icon (`ic_launcher_bg`, `ic_launcher_fg` and a one-colour
-`ic_launcher_mono` for themed icons), the home screen header draws `ic_logo`, and
-the notification icon is the one-colour mark. `docs/icon-512.png` is the Play
-store icon.
+`ic_launcher_mono` for themed icons) and the notification icon is the one-colour
+mark. Inside the app the home screen header paints the same shapes in code
+(`LogoDrawable`, from the generated `LogoPaths`) with a gradient built from the
+accent colour the user picked and a tile that takes the current look's corners,
+so it follows the theme. The launcher icon, which nothing can theme, keeps the
+fixed azure-to-mint. `docs/icon-512.png` is the Play store icon.
 
 To change it, edit the numbers at the top of `tools/logo/design.py` (ring size,
 thickness, gap) or the colours in `tools/logo/render.py`, then run
 `python3 tools/logo/export_android.py .` (needs `numpy` and `pillow`). That
-rewrites the drawables and the two PNGs. `tools/logo/trace_note.py` is how the
+rewrites the drawables, `LogoPaths.java` and the two PNGs. `tools/logo/trace_note.py` is how the
 note was first traced from a reference image.
 
 ## Publishing
