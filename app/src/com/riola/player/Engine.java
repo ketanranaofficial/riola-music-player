@@ -85,6 +85,7 @@ public class Engine {
 
     private Engine(Context c) {
         ctx = c;
+        Bell.init(c);
         prefs = new Prefs(c);
     }
 

@@ -1,13 +1,18 @@
 package com.riola.player;
 
+import android.content.Context;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioTrack;
 import android.os.Handler;
 import android.os.Looper;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 
 /**
- * A soft struck bell, synthesised at runtime so the apk carries no audio files.
+ * A soft struck bell. The four voices ship as short wav files in res/raw, made
+ * from the synthesis below by tools/gen-bells.sh, so a ring never waits on the
+ * maths. If a file cannot be read the same samples are synthesised instead.
  *
  * The gentleness comes from the envelope, not the volume: the bright partials
  * die away in well under a second while the low ones ring on for seconds, and
@@ -31,18 +36,60 @@ public class Bell {
     public static long lengthMs(int tone) { return LEN[clamp(tone)]; }
     public static String toneName(int tone) { return NAMES[clamp(tone)]; }
 
-    /** Build the samples ahead of time so the first ring is not late. */
-    public static void warm() {
+    private static volatile Context appCtx;
+    private static final int[] RAW = { R.raw.bell_low, R.raw.bell_warm, R.raw.bell_bright, R.raw.bell_desk };
+
+    /** Tells the bell where its sound files live. Safe to call more than once. */
+    public static void init(Context c) {
+        if (c != null) appCtx = c.getApplicationContext();
+    }
+
+    /** Load every voice ahead of time so the first ring is not late. */
+    public static void warm(Context c) {
+        init(c);
         new Thread(new Runnable() {
             public void run() {
-                try { pcm(WARM); } catch (Throwable t) { /* not important */ }
+                try { for (int t = 0; t < 4; t++) pcm(t); } catch (Throwable t) { /* not important */ }
             }
         }, "riola-bell-warm").start();
     }
 
     private static synchronized short[] pcm(int tone) {
         tone = clamp(tone);
-        if (CACHE[tone] != null) return CACHE[tone];
+        if (CACHE[tone] == null) {
+            short[] out = fromFile(tone);
+            CACHE[tone] = out != null ? out : synthesize(tone);
+        }
+        return CACHE[tone];
+    }
+
+    /** The shipped recording of a voice, or null if it is missing or the wrong size. */
+    private static short[] fromFile(int tone) {
+        Context c = appCtx;
+        if (c == null) return null;
+        InputStream in = null;
+        try {
+            in = c.getResources().openRawResource(RAW[tone]);
+            ByteArrayOutputStream bo = new ByteArrayOutputStream();
+            byte[] buf = new byte[16384];
+            int r;
+            while ((r = in.read(buf)) > 0) bo.write(buf, 0, r);
+            byte[] b = bo.toByteArray();
+            int n = (int) (RATE * LEN[tone] / 1000L);
+            if (b.length != 44 + n * 2) return null;       // a plain 44 byte wav header, then the samples
+            short[] out = new short[n];
+            for (int i = 0; i < n; i++) out[i] = (short) ((b[44 + 2 * i] & 0xff) | (b[45 + 2 * i] << 8));
+            return out;
+        } catch (Exception e) {
+            return null;
+        } finally {
+            if (in != null) try { in.close(); } catch (Exception e) { /* ignore */ }
+        }
+    }
+
+    /** Builds the samples from the formula. This is what the wav files were made from. */
+    static short[] synthesize(int tone) {
+        tone = clamp(tone);
 
         int n = (int) (RATE * LEN[tone] / 1000L);
         short[] out = new short[n];
@@ -97,7 +144,6 @@ public class Bell {
             if (v < -32000) v = -32000;
             out[i] = (short) v;
         }
-        CACHE[tone] = out;
         return out;
     }
 

@@ -62,11 +62,15 @@ Every playing step repeats either **a number of times** or **for a length of
 time**, and can carry a gap between repeats, its own speed, its own volume, and
 an on/off switch so you can park a step without deleting it.
 
-**The bell** is synthesised at runtime, so the APK still carries no audio
-assets. Six partials over a fundamental, where the bright ones decay in under a
-second and the low ones ring on for four to six, an 8 ms ramped attack so there
-is no click, and a second prime a hair sharp for a slow shimmer. Three voices,
-one to nine rings with a gap you choose. It is built to mark a moment without
+**The bell** ships as four short wav files in `app/res/raw/`, so a ring never
+waits on any maths. They were made by `tools/gen-bells.sh` from a formula in
+`Bell.java` (the app falls back to that formula if a file cannot be read), and
+cost about 1.4 MB of the APK. Six partials over a fundamental, where the bright
+ones decay in under a second and the low ones ring on for four to six, an 8 ms
+ramped attack so there is no click, and a second prime a hair sharp for a slow
+shimmer. Four voices (low, warm, bright, desk), one to nine rings with a gap you
+choose. A bell at the end of a silence rings out in full before the next step
+starts, unless that step is more silence. It is built to mark a moment without
 jolting you — which matters when the whole point is that your eyes are closed.
 
 **Sections** can be typed as minutes and seconds, or marked by ear: play the
@@ -117,7 +121,7 @@ No network permission, no accounts, no analytics. Nothing leaves the phone.
 | `MainActivity` | home: saved programs, live step list, settings |
 | `EditorActivity` | the tap-to-build program editor |
 | `NowPlayingActivity` | the full screen player |
-| `Bell` | the synthesised chime |
+| `Bell` | the chime: loads the bell wav files, or synthesises them |
 | `Runner` | pre-play checks, then hands the program to the engine |
 | `LibraryActivity` | the track library |
 | `StepSheet` | the editor for one step |

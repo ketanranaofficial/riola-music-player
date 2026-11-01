@@ -40,7 +40,7 @@ public class MainActivity extends Activity implements PlayerBar.Host {
         super.onCreate(saved);
         Store.load(this);
         eng = Engine.get(this);
-        Bell.warm();
+        Bell.warm(this);
         setContentView(build());
         Ui.applyWindow(this);
         if (reopenSettings) {
