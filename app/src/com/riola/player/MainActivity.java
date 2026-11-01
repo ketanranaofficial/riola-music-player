@@ -12,6 +12,7 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import android.text.util.Linkify;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -438,19 +439,36 @@ public class MainActivity extends Activity implements PlayerBar.Host {
         int p = Ui.dp(this, 20);
         box.setPadding(p, Ui.dp(this, 4), p, 0);
         for (int i = 0; i < HelpText.SECTIONS.length; i++) {
-            String[] section = HelpText.SECTIONS[i];
-            TextView h = Ui.tv(this, section[0], 14, Ui.ACC_TXT, true);
-            Ui.margin(this, h, 0, i == 0 ? 0 : 18, 0, 6);
-            box.addView(h);
-            TextView b = Ui.tv(this, section[1], 13.5f, Ui.TXT, false);
-            b.setLineSpacing(Ui.dp(this, 3), 1f);
-            b.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
-            box.addView(b);
+            addHelpSection(box, HelpText.SECTIONS[i][0], HelpText.SECTIONS[i][1], i == 0);
         }
+        addHelpSection(box, HelpText.ABOUT_TITLE, HelpText.about(versionText()), false);
         box.addView(Ui.gap(this, 12));
         ScrollView sv = new ScrollView(this);
         sv.addView(box, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
         Ui.dialog(this).setTitle("How Riola works").setView(sv).setPositiveButton("Close", null).show();
+    }
+
+    private void addHelpSection(LinearLayout box, String heading, String body, boolean first) {
+        TextView h = Ui.tv(this, heading, 14, Ui.ACC_TXT, true);
+        Ui.margin(this, h, 0, first ? 0 : 18, 0, 6);
+        box.addView(h);
+        TextView b = Ui.tv(this, body, 13.5f, Ui.TXT, false);
+        b.setLineSpacing(Ui.dp(this, 3), 1f);
+        b.setLayoutParams(Ui.lp(Ui.MATCH, Ui.WRAP));
+        // a web address in the text opens in the phone's browser; the app itself
+        // still has no network permission
+        Linkify.addLinks(b, Linkify.WEB_URLS);
+        b.setLinkTextColor(Ui.ACC_TXT);
+        box.addView(b);
+    }
+
+    private String versionText() {
+        try {
+            android.content.pm.PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
+            return pi.versionName + " (" + pi.versionCode + ")";
+        } catch (Exception e) {
+            return "unknown";
+        }
     }
 
     private String colourName(int c) {

@@ -88,9 +88,10 @@ while you fine-tune it.
   picture. Where a file carries several audio streams, a dubbed film say, you
   can pick which one that track uses.
 - **Colour and Look** — the palette is derived from one accent colour: eight
-  presets or mix your own. Six looks change shape rather than just shade —
-  Material, Elegant, Retro, Coder, 98 and Futuristic each drive corner radius,
-  border weight, typeface, spacing and icon line weight. Both are independent
+  presets or mix your own. Ten looks change shape rather than just shade —
+  Material, Elegant, Retro, Coder, 98, Futuristic, Neon, Pastel, Brutalist and
+  Minimal each drive corner radius, border weight, typeface, spacing and icon
+  line weight. Both are independent
   of dark mode and of each other.
 - **Export and import** — a program, or all of them, written to a file you
   choose and read back later. Import treats the file as untrusted and reports
