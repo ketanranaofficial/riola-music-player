@@ -151,6 +151,7 @@ public final class Pickers {
         in.selectAll();          // typing replaces the suggestion instead of appending
         in.setTextColor(Ui.TXT);
         in.setHintTextColor(Ui.DIM);
+        Ui.accentInput(in, true);
         LinearLayout box = Ui.col(a);
         int p = Ui.dp(a, 20);
         box.setPadding(p, Ui.dp(a, 8), p, 0);

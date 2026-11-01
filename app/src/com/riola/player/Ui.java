@@ -9,6 +9,7 @@ import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.os.Build;
 import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
@@ -16,6 +17,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.CompoundButton;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -315,6 +317,34 @@ public final class Ui {
         for (int w : which) {
             Button b = d.getButton(w);
             if (b != null) b.setTextColor(text);
+        }
+    }
+
+    /**
+     * A text field's cursor, selection, handles and (optionally) underline all default to
+     * one colour from the base theme, which knows nothing about the accent the user picked.
+     * This colours them from the accent instead. Pass underline = false for a field that
+     * draws its own box, so that background is left alone.
+     */
+    public static void accentInput(EditText e, boolean underline) {
+        int c = ACC_TXT;
+        Context ctx = e.getContext();
+        e.setHighlightColor((c & 0x00FFFFFF) | 0x55000000);
+        if (underline && e.getBackground() != null) {
+            e.setBackgroundTintList(new ColorStateList(
+                    new int[][] { { android.R.attr.state_focused }, {} }, new int[] { c, DIM }));
+        }
+        if (Build.VERSION.SDK_INT >= 29) {
+            try {
+                GradientDrawable cursor = new GradientDrawable();
+                cursor.setColor(c);
+                cursor.setSize(Math.max(2, dp(ctx, 2)), -1);
+                e.setTextCursorDrawable(cursor);
+                Drawable left = e.getTextSelectHandleLeft(), right = e.getTextSelectHandleRight(), mid = e.getTextSelectHandle();
+                if (left != null)  { left = left.mutate();   left.setTint(c);  e.setTextSelectHandleLeft(left); }
+                if (right != null) { right = right.mutate(); right.setTint(c); e.setTextSelectHandleRight(right); }
+                if (mid != null)   { mid = mid.mutate();     mid.setTint(c);   e.setTextSelectHandle(mid); }
+            } catch (Throwable t) { /* the cursor stays the default colour */ }
         }
     }
 

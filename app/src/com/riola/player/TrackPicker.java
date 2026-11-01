@@ -65,6 +65,7 @@ public final class TrackPicker {
         search.setTextColor(Ui.TXT);
         search.setHintTextColor(Ui.DIM);
         search.setBackground(Ui.rrs(a, Ui.FIELD, Ui.LINE, Ui.RAD_BTN, Ui.STROKE_W));
+        Ui.accentInput(search, false);
         int sp = Ui.dp(a, 10);
         search.setPadding(sp, sp, sp, sp);
         search.setLayoutParams(Ui.lpw(0, Ui.WRAP, 1f));
