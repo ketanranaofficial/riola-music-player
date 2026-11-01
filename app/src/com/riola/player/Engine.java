@@ -492,6 +492,7 @@ public class Engine {
         long remain = budget;
         long fade = Math.min(fadeMs, Math.max(0, (end - start) / 4));
         int rep = 0;
+        boolean warned = false;
 
         applySpeed();
         startAt(start);
@@ -541,15 +542,41 @@ public class Engine {
             }
             push();
 
-            // The position check below can count a pass a few ms before the
-            // player reports its own completion; that report then arrives
-            // after startAt() has cleared the flag and would count the same
-            // pass twice, cutting the repeat short. A real completion cannot
-            // come this soon after a restart, so drop it.
-            if (completed && known && now <= grace && end - start > 1500) completed = false;
+            // A pass cannot really end in the first half of its length. An end
+            // signal that early is a leftover: a completion report for the
+            // pass before, or a position still read from before the seek
+            // landed. Counting it would cut the repeat short, so drop it and
+            // say so in the log. A real completion leaves the player stopped,
+            // so one that arrives while it is playing is a leftover. So is one
+            // in the first second, which can land before the restart has taken
+            // effect and so finds the player not yet playing.
+            long passMs = now - (grace - 400);          // playing time this pass, pauses excluded
+            long expect = known ? (long) ((end - start) / Math.min(3f, Math.max(0.25f, speed * stepSpeed))) : 0;
+            boolean tooSoon = expect > 1000 && passMs < expect / 2;
+            if (completed && tooSoon && (passMs < 1000 || playerPlaying())) {
+                completed = false;
+                log("  (ignored an early end signal, " + passMs + " ms into a " + expect + " ms pass)");
+                if (!paused && !playerPlaying()) {
+                    // the leftover signal can also leave the player stopped
+                    startAt(start);
+                    grace = SystemClock.elapsedRealtime() + 400;
+                    continue;
+                }
+            }
+            if (tooSoon && !warned && now > grace && known && pos >= end - 30) {
+                warned = true;
+                log("  (ignored an early position reading, " + passMs + " ms into a " + expect + " ms pass)");
+            }
+            if (!paused && !completed && known && passMs > 5000 && pos < end - 1000 && !playerPlaying()) {
+                // stopped by itself with no end signal: start it again rather than wait for ever
+                log("  (player stopped by itself " + passMs + " ms into the pass - starting it again)");
+                startAt(start);
+                grace = SystemClock.elapsedRealtime() + 400;
+                continue;
+            }
 
             boolean byCompletion = completed;
-            boolean atEnd = completed || (now > grace && known && pos >= end - 30);
+            boolean atEnd = completed || (now > grace && !tooSoon && known && pos >= end - 30);
             if (!atEnd) continue;
 
             completed = false;
@@ -577,6 +604,7 @@ public class Engine {
             }
             setGain(fade > 0 ? 0.02f : 1f);
             startAt(start);
+            warned = false;
             grace = SystemClock.elapsedRealtime() + 400;
             last = SystemClock.elapsedRealtime();
         }
@@ -673,6 +701,12 @@ public class Engine {
         try { m.release(); } catch (Exception e) { /* ignore */ }
     }
 
+    private boolean playerPlaying() {
+        MediaPlayer m = mp;
+        if (m == null) return false;
+        try { return m.isPlaying(); } catch (IllegalStateException e) { return false; }
+    }
+
     private int position() {
         MediaPlayer m = mp;
         if (m == null) return 0;
@@ -735,6 +769,7 @@ public class Engine {
 
     public void log(String line) {
         final String entry = Fmt.ms(SystemClock.elapsedRealtime() % 3600000L) + "  " + line;
+        android.util.Log.i("riola", line);
         synchronized (logBuf) {
             logBuf.append(entry).append('\n');
             if (logBuf.length() > 24000) logBuf.delete(0, logBuf.length() - 16000);
