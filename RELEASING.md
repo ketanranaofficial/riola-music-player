@@ -42,7 +42,7 @@ export RIOLA_STOREPASS="..."
 ./build.sh --clean --release \
   --keystore ~/keys/riola-upload.jks \
   --alias riola \
-  --version-code 5 --version-name "1.1"
+  --version-code 6 --version-name "1.2"
 ```
 
 `--version-code` must increase with every upload. `--version-name` is what people
