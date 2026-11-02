@@ -1,0 +1,1 @@
+Build change only: the APK is now byte-for-byte reproducible, so F-Droid can verify it. Nothing differs in use.

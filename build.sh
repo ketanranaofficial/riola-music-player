@@ -23,13 +23,16 @@
 #     instead, so the password is never on the command line.
 set -euo pipefail
 cd "$(dirname "$0")"
+# Zip entry times come from the clock and the time zone; pin both so the same source
+# gives the same APK anywhere (F-Droid compares its build with the published one).
+export TZ=UTC
 
 OUT=build
 APK_NAME=riola.apk
 MIN_SDK=26
 TARGET_SDK=0
-VERSION_CODE=8
-VERSION_NAME=1.4
+VERSION_CODE=9
+VERSION_NAME=1.5
 CLEAN=0 INSTALL=0 RELEASE=0
 KEYSTORE='' KEY_ALIAS=''
 APP_ID='' DEBUGGABLE=0
@@ -170,6 +173,7 @@ javac -nowarn -Xlint:-options -source 8 -target 8 -parameters -bootclasspath "$A
 # class -> dex, then add the dex to the apk
 jar cf "$OUT/classes.jar" -C "$OUT/classes" .
 d8 --lib "$ANDROID_JAR" --min-api "$MIN_SDK" --output "$OUT" "$OUT/classes.jar"
+touch -d "1980-01-01 00:00:00 UTC" "$OUT/classes.dex"
 ( cd "$OUT" && jar uf unaligned.apk classes.dex )
 
 # align, then sign (signing preserves the alignment)
