@@ -1,0 +1,1 @@
+Counts repeats correctly on Bluetooth and a locked screen, bells no longer overlap the next step, new logo, accent colour applied to toggles, dialogs and text fields, Neon light theme readable.

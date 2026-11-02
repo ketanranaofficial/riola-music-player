@@ -1,0 +1,36 @@
+# Draft recipe for https://gitlab.com/fdroid/fdroiddata  (metadata/com.riola.player.yml)
+# Not used by this repo; kept here so it travels with the source. See docs/fdroid/README.md.
+Categories:
+  - Multimedia
+License: MIT
+AuthorName: Ketan Rana
+WebSite: https://github.com/ketanranaofficial/riola-music-player
+SourceCode: https://github.com/ketanranaofficial/riola-music-player
+IssueTracker: https://github.com/ketanranaofficial/riola-music-player/issues
+
+AutoName: Riola
+
+RepoType: git
+Repo: https://github.com/ketanranaofficial/riola-music-player.git
+
+Builds:
+  - versionName: '1.3'
+    versionCode: 7
+    commit: v1.3
+    sudo:
+      - apt-get update
+      - apt-get install -y openjdk-17-jdk-headless
+    output: build/riola.apk
+    build: ./build.sh --clean --version-code 7 --version-name 1.3
+    # Needs aapt2, d8, zipalign and apksigner. If the buildserver lacks d8/apksigner,
+    # the reviewers will say which SDK path to use; adjust here.
+
+# For updates from the GitHub APK to work through F-Droid, use a reproducible build and
+# publish with the upstream signature (fill in after a first successful build):
+#Binaries: https://github.com/ketanranaofficial/riola-music-player/releases/download/v%v/riola-%v.apk
+#AllowedAPKSigningKeys: 173c56b3d578230c2719a5dbb363b032c4580e677121e42ad6308f39aada18b3
+
+AutoUpdateMode: Version
+UpdateCheckMode: Tags
+CurrentVersion: '1.3'
+CurrentVersionCode: 7

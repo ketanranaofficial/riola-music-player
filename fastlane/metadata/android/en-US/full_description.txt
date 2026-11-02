@@ -1,0 +1,15 @@
+Riola is a programmable music player. Add some tracks, then build a program by tapping: play this whole track, loop that 40-second section eight times with a three-second rest between each, sit in silence for two minutes, repeat the whole thing four times.
+
+Made for practice loops, sleep and meditation sequences, interval training and ear training: anything where "play this bit for ten minutes, rest two, then the whole thing twice" is easier to set up once than to babysit.
+
+<b>Features</b>
+<ul>
+<li>No scripting and nothing to type: every part of a program is a tap</li>
+<li>Loop a section of a track a set number of times, with rests in between</li>
+<li>Silent steps, and soft bells to mark the start and end of a step</li>
+<li>Plays on with the screen locked, with media controls in the notification</li>
+<li>Ten colour looks, light and dark</li>
+</ul>
+
+<b>Privacy</b>
+No ads, no accounts, no purchases, no tracking, and no internet permission at all. Your tracks and programs stay on your phone.
