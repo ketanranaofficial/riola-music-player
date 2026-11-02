@@ -14,9 +14,9 @@ Binaries:
   https://github.com/ketanranaofficial/riola-music-player/releases/download/v%v/riola-%v.apk
 
 Builds:
-  - versionName: '1.4'
-    versionCode: 8
-    commit: d02b2660db07aae515345262711a10ed7e08694a
+  - versionName: '1.5'
+    versionCode: 9
+    commit: 91b44399991766fae43cec3ecaa7893bb9635839
     output: build/riola.apk
     prebuild:
       - mkdir -p $HOME/sdk-riola
@@ -36,5 +36,5 @@ AllowedAPKSigningKeys: 173c56b3d578230c2719a5dbb363b032c4580e677121e42ad6308f39a
 AutoUpdateMode: Version
 UpdateCheckMode: Tags
 UpdateCheckData: build.sh|VERSION_CODE=(\d+)|.|VERSION_NAME=(.+)
-CurrentVersion: '1.4'
-CurrentVersionCode: 8
+CurrentVersion: '1.5'
+CurrentVersionCode: 9
