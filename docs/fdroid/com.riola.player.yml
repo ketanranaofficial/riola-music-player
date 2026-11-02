@@ -1,5 +1,3 @@
-# Draft recipe for https://gitlab.com/fdroid/fdroiddata  (metadata/com.riola.player.yml)
-# Not used by this repo; kept here so it travels with the source. See docs/fdroid/README.md.
 Categories:
   - Multimedia
 License: MIT
@@ -12,30 +10,31 @@ AutoName: Riola
 
 RepoType: git
 Repo: https://github.com/ketanranaofficial/riola-music-player.git
+Binaries: 
+  https://github.com/ketanranaofficial/riola-music-player/releases/download/v%v/riola-%v.apk
 
 Builds:
-  - versionName: '1.3'
-    versionCode: 7
-    commit: v1.3
+  - versionName: '1.4'
+    versionCode: 8
+    commit: d02b2660db07aae515345262711a10ed7e08694a
+    output: build/riola.apk
     prebuild:
       - mkdir -p $HOME/sdk-riola
       - curl -Lo $HOME/sdk-riola/build-tools.zip https://dl.google.com/android/repository/build-tools_r34-linux.zip
-      - echo "e858c4b60069d0431051b225d384413b1643e1289b00a4825aed347f25bd510f  $HOME/sdk-riola/build-tools.zip" | sha256sum -c -
+      - echo "e858c4b60069d0431051b225d384413b1643e1289b00a4825aed347f25bd510f  $HOME/sdk-riola/build-tools.zip"
+        | sha256sum -c -
       - curl -Lo $HOME/sdk-riola/platform.zip https://dl.google.com/android/repository/platform-34-ext7_r03.zip
-      - echo "16fdb74c55e59ae3ef52def135aec713508467bd56d7dabcd8c9be31fa8b20f3  $HOME/sdk-riola/platform.zip" | sha256sum -c -
+      - echo "16fdb74c55e59ae3ef52def135aec713508467bd56d7dabcd8c9be31fa8b20f3  $HOME/sdk-riola/platform.zip"
+        | sha256sum -c -
       - unzip -q $HOME/sdk-riola/build-tools.zip -d $HOME/sdk-riola
       - unzip -q $HOME/sdk-riola/platform.zip -d $HOME/sdk-riola
-    output: build/riola.apk
-    build: BUILD_TOOLS=$HOME/sdk-riola/android-14 ANDROID_JAR=$HOME/sdk-riola/android-34/android.jar ./build.sh --clean --version-code $$VERCODE$$ --version-name $$VERSION$$
-    # Google's build-tools r34 and the API 34 platform are checked against SHA-256 values
-    # computed from Google's own downloads (their published SHA-1s match). Debian does
-    # not package aapt2 or d8.
+    build: BUILD_TOOLS=$HOME/sdk-riola/android-14 ANDROID_JAR=$HOME/sdk-riola/android-34/android.jar
+      ./build.sh --clean --version-code $$VERCODE$$ --version-name $$VERSION$$
 
-# Reproducible build: F-Droid copies the upstream signature onto its own build (checked: a clean build matches the release APK in every file except META-INF), so GitHub and F-Droid installs share one signing key and update each other.
-Binaries: https://github.com/ketanranaofficial/riola-music-player/releases/download/v%v/riola-%v.apk
 AllowedAPKSigningKeys: 173c56b3d578230c2719a5dbb363b032c4580e677121e42ad6308f39aada18b3
 
 AutoUpdateMode: Version
 UpdateCheckMode: Tags
-CurrentVersion: '1.3'
-CurrentVersionCode: 7
+UpdateCheckData: build.sh|VERSION_CODE=(\d+)|.|VERSION_NAME=(.+)
+CurrentVersion: '1.4'
+CurrentVersionCode: 8
