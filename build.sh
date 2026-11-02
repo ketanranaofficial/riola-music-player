@@ -28,8 +28,8 @@ OUT=build
 APK_NAME=riola.apk
 MIN_SDK=26
 TARGET_SDK=0
-VERSION_CODE=7
-VERSION_NAME=1.3
+VERSION_CODE=8
+VERSION_NAME=1.4
 CLEAN=0 INSTALL=0 RELEASE=0
 KEYSTORE='' KEY_ALIAS=''
 APP_ID='' DEBUGGABLE=0
@@ -161,8 +161,10 @@ aapt2 link "${EXTRA[@]}" -I "$ANDROID_JAR" --manifest app/AndroidManifest.xml -R
            -o "$OUT/unaligned.apk"
 
 # java -> class (framework classes come from android.jar only)
+# (-parameters: with JDK 21 the dexer in build-tools 34 crashes on anonymous classes without it,
+#  and with it JDK 17 and 21 produce identical output, which F-Droid's reproducible check needs.)
 mapfile -t SOURCES < <(find app/src "$OUT/gen" -name '*.java' | sort)
-javac -nowarn -Xlint:-options -source 8 -target 8 -bootclasspath "$ANDROID_JAR" \
+javac -nowarn -Xlint:-options -source 8 -target 8 -parameters -bootclasspath "$ANDROID_JAR" \
       -encoding US-ASCII -d "$OUT/classes" "${SOURCES[@]}"
 
 # class -> dex, then add the dex to the apk

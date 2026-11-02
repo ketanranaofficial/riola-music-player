@@ -49,7 +49,7 @@ phone still in use.
 ./build.sh --clean --release \
   --keystore ~/keys/riola-release.jks \
   --alias riola \
-  --version-code 8 --version-name "1.4"
+  --version-code 9 --version-name "1.5"
 ```
 
 It asks for the keystore password in the terminal, with nothing echoed and nothing
