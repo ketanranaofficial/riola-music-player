@@ -42,7 +42,14 @@ public final class Ui {
     public interface OnValue  { void set(int v); }
     public interface OnPick   { void set(int index); }
 
+    /** The Dark theme switch, as the user set it. */
     public static boolean dark = true;
+    /**
+     * Whether the colours themselves are dark. Usually the same as {@link #dark}, but not
+     * always: the Neon look is a dark palette even with the Dark theme switch off. Anything
+     * that has to match the colours (dialogs, system bar icons, status colours) goes by this.
+     */
+    public static boolean darkPalette = true;
     public static int BG, SURF, SURF2, LINE, TXT, DIM, ACC, ACC2, RED, GREEN, AMBER, RIPPLE, ONACC, FIELD;
     /** The accent, nudged until it is legible as text on a card. */
     public static int ACC_TXT;
@@ -109,7 +116,6 @@ public final class Ui {
         }
 
         ACC = accent == 0 ? ACCENTS[0] : accent;
-        ACC2 = shift(ACC, isDark);
         ONACC = luminance(ACC) > 0.55f ? 0xFF101418 : 0xFFFFFFFF;
 
         // defaults, then the look adjusts them
@@ -231,8 +237,15 @@ public final class Ui {
         // Only now are the surfaces final, so the legible accent has to be
         // worked out here rather than above: a pale accent is invisible on a
         // white card, and a dark one vanishes on a black one.
-        ACC_TXT = readable(ACC, SURF, isDark);
-        ACC_SOFT = blend(ACC, SURF, isDark ? 0.20f : 0.14f);
+        darkPalette = luminance(BG) < 0.5f;
+        if (darkPalette && !isDark) {
+            // a look whose light variant is dark: the red, green, amber and ripple made for a
+            // pale page would sink into it, so it gets the ones made for a dark page
+            RED = 0xFFFF6B6B; GREEN = 0xFF3DDC97; AMBER = 0xFFFFC65C; RIPPLE = 0x33FFFFFF;
+        }
+        ACC2 = shift(ACC, darkPalette);
+        ACC_TXT = readable(ACC, SURF, darkPalette);
+        ACC_SOFT = blend(ACC, SURF, darkPalette ? 0.20f : 0.14f);
     }
 
     /** Lighten or darken the accent until it stands off the surface behind it. */
@@ -284,13 +297,14 @@ public final class Ui {
     public static void applyWindow(Activity a) {
         a.getWindow().setStatusBarColor(BG);
         a.getWindow().setNavigationBarColor(BG);
-        int flags = dark ? 0 : (View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+        int flags = darkPalette ? 0 : (View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
         a.getWindow().getDecorView().setSystemUiVisibility(flags);
     }
 
-    public static int themeRes(boolean isDark) {
-        return isDark ? android.R.style.Theme_Material_NoActionBar
-                      : android.R.style.Theme_Material_Light_NoActionBar;
+    /** The base theme for a screen. Call Ui.theme first: it goes by the colours, not the switch. */
+    public static int themeRes() {
+        return darkPalette ? android.R.style.Theme_Material_NoActionBar
+                           : android.R.style.Theme_Material_Light_NoActionBar;
     }
 
     /**
@@ -299,7 +313,7 @@ public final class Ui {
      * are tinted as the dialog is shown instead, which covers every dialog at once.
      */
     public static AlertDialog.Builder dialog(Activity a) {
-        return new AlertDialog.Builder(a, dark ? R.style.RiolaDialog : R.style.RiolaDialogLight) {
+        return new AlertDialog.Builder(a, darkPalette ? R.style.RiolaDialog : R.style.RiolaDialogLight) {
             @Override public AlertDialog create() {
                 AlertDialog d = super.create();
                 d.setOnShowListener(new DialogInterface.OnShowListener() {

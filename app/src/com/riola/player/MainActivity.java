@@ -37,7 +37,7 @@ public class MainActivity extends Activity implements PlayerBar.Host {
     protected void onCreate(Bundle saved) {
         prefs = new Prefs(this);
         Ui.theme(prefs);
-        setTheme(Ui.themeRes(prefs.dark()));
+        setTheme(Ui.themeRes());
         super.onCreate(saved);
         Store.load(this);
         eng = Engine.get(this);
